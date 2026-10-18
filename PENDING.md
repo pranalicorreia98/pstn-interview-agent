@@ -180,6 +180,20 @@ Once all blockers are resolved:
 
 ---
 
+## ✅ Recently Implemented
+
+### Communication Skills Fallback (DONE)
+When no technical skills are provided from the database, the interview bot automatically:
+- Assesses communication skills and confidence
+- Asks about general background and career journey
+- Discusses work style preferences
+- Explores personal interests, hobbies, family (if comfortable)
+- Understands career goals and aspirations
+
+This ensures every interview is meaningful even without specific skill requirements.
+
+---
+
 ## 🚨 Go-Live Checklist
 
 Before production:
