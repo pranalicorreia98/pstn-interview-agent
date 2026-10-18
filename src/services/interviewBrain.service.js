@@ -41,6 +41,48 @@ try {
 const SAMPLE_RATE = 16000;
 
 /**
+ * Default communication skills topics when no technical skills are provided.
+ * Used for general assessment of soft skills, personality, and cultural fit.
+ */
+const DEFAULT_COMMUNICATION_SKILLS_PROMPT = `
+When no specific technical skills are provided for assessment, conduct a friendly conversational interview focusing on:
+
+1. **Communication Skills**: Assess how clearly and confidently the candidate expresses themselves
+2. **General Background**: Ask about their educational background and career journey
+3. **Work Style**: Understand their preferred work environment and collaboration style
+4. **Problem Solving**: Ask about challenges they've faced and how they handled them
+5. **Personal Interests**: Learn about their hobbies, interests, or what motivates them
+6. **Career Goals**: Understand their aspirations and what they're looking for
+
+Keep the conversation warm and friendly. You can discuss topics like:
+- Their family background (if they're comfortable)
+- Where they grew up or currently live
+- What they enjoy doing outside of work
+- Their strengths and areas they want to improve
+- Why they're interested in this opportunity
+
+The goal is to assess their communication ability, personality, and cultural fit rather than technical expertise.
+Ask open-ended questions and show genuine interest in their responses.
+`;
+
+/**
+ * Determine effective skills - use provided skills or fall back to communication assessment
+ */
+function getEffectiveSkills(skills) {
+  if (skills && skills.trim().length > 0) {
+    return {
+      skills: skills.trim(),
+      isDefaultCommunication: false,
+    };
+  }
+
+  return {
+    skills: 'Communication Skills, Soft Skills, General Assessment',
+    isDefaultCommunication: true,
+  };
+}
+
+/**
  * Strip markdown and formatting artifacts so TTS speaks clean text.
  */
 function sanitizeForTTS(text) {
@@ -120,14 +162,25 @@ class InterviewBrainService {
     const normalizedLanguage = getNormalizedLangCode(config.language);
     const languageConfig = getLanguageConfig(normalizedLanguage);
 
+    // Check if skills are provided, otherwise fall back to communication skills assessment
+    const { skills: effectiveSkills, isDefaultCommunication } = getEffectiveSkills(config.skills);
+
+    // Build the system prompt, appending communication skills guidance if needed
+    let systemPrompt = config.prompt || this.defaultPrompt;
+    if (isDefaultCommunication) {
+      logger.info('No technical skills provided, using communication skills assessment', { sessionId });
+      systemPrompt = `${systemPrompt}\n\n${DEFAULT_COMMUNICATION_SKILLS_PROMPT}`;
+    }
+
     const sessionConfig = {
-      prompt: config.prompt || this.defaultPrompt,
+      prompt: systemPrompt,
       greeting: config.greeting || this.defaultGreeting,
       closing: config.closing || this.defaultClosing,
       language: normalizedLanguage,
-      skills: config.skills || '',
+      skills: effectiveSkills,
       autoGreet: config.autoGreet !== false, // Default true for phone
       questionCount: config.questionCount || 0, // 0 = screening (unlimited)
+      isDefaultCommunication, // Track if we're using default communication mode
     };
 
     // Apply language-specific greeting/closing templates
