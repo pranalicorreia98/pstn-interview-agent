@@ -1,0 +1,43 @@
+{
+  "name": "pstn-interview-agent",
+  "version": "1.0.0",
+  "description": "PSTN phone interview agent using LiveKit SIP - same interview brain as Zoom bot, different transport",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "nodemon src/index.js",
+    "test": "jest"
+  },
+  "keywords": [
+    "pstn",
+    "phone",
+    "interview",
+    "livekit",
+    "sip",
+    "voice-agent",
+    "deepgram",
+    "tts"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "@deepgram/sdk": "^3.9.0",
+    "@google-cloud/text-to-speech": "^5.5.0",
+    "@livekit/rtc-node": "^0.12.0",
+    "@supabase/supabase-js": "^2.45.0",
+    "dotenv": "^16.4.0",
+    "express": "^4.21.0",
+    "js-yaml": "^4.1.0",
+    "livekit-server-sdk": "^2.9.0",
+    "openai": "^4.73.0",
+    "uuid": "^10.0.0",
+    "winston": "^3.14.0"
+  },
+  "devDependencies": {
+    "jest": "^29.7.0",
+    "nodemon": "^3.1.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
