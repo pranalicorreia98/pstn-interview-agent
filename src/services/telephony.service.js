@@ -1,8 +1,18 @@
 /**
  * Telephony Service
  *
- * Handles outbound PSTN calls via LiveKit SIP.
- * Creates SIP participants in LiveKit rooms to dial candidates.
+ * Handles outbound PSTN calls via LiveKit SIP with Vobiz as the SIP trunk provider.
+ *
+ * Vobiz provides:
+ * - India-native SIP trunking with DLT/TRAI compliance built-in
+ * - ₹0.45/min for India calls
+ * - Sub-80ms latency
+ * - Instant SIP trunks with Airtel, Jio, VIL
+ *
+ * Setup flow:
+ * 1. Create Vobiz account and SIP trunk
+ * 2. Configure trunk in LiveKit with Vobiz credentials
+ * 3. Use trunk ID here for outbound calls
  */
 
 const { AccessToken, SipClient } = require('livekit-server-sdk');
@@ -10,12 +20,18 @@ const logger = require('../utils/logger');
 
 class TelephonyService {
   constructor() {
+    // LiveKit configuration
     this.livekitUrl = process.env.LIVEKIT_URL;
     this.apiKey = process.env.LIVEKIT_API_KEY;
     this.apiSecret = process.env.LIVEKIT_API_SECRET;
     this.sipTrunkId = process.env.LIVEKIT_SIP_OUTBOUND_TRUNK_ID;
 
+    // Vobiz configuration (for reference/validation)
+    this.vobizSipDomain = process.env.VOBIZ_SIP_DOMAIN; // e.g., your_domain.sip.vobiz.ai
+    this.vobizCallerId = process.env.VOBIZ_CALLER_ID;   // Your Vobiz phone number
+
     // Business hours config (India timezone default)
+    // TRAI compliance: Commercial calls only during business hours
     this.businessHoursStart = parseInt(process.env.BUSINESS_HOURS_START) || 9;
     this.businessHoursEnd = parseInt(process.env.BUSINESS_HOURS_END) || 21;
     this.timezone = process.env.BUSINESS_HOURS_TIMEZONE || 'Asia/Kolkata';
@@ -31,6 +47,13 @@ class TelephonyService {
   }
 
   /**
+   * Check if Vobiz is configured
+   */
+  isVobizConfigured() {
+    return !!(this.vobizSipDomain);
+  }
+
+  /**
    * Initialize SIP client
    */
   initialize() {
@@ -40,12 +63,19 @@ class TelephonyService {
     }
 
     this.sipClient = new SipClient(this.livekitUrl, this.apiKey, this.apiSecret);
-    logger.info('Telephony service initialized', { livekitUrl: this.livekitUrl });
+
+    logger.info('Telephony service initialized', {
+      livekitUrl: this.livekitUrl,
+      vobizConfigured: this.isVobizConfigured(),
+      vobizDomain: this.vobizSipDomain ? `${this.vobizSipDomain.slice(0, 10)}...` : 'not set',
+    });
+
     return true;
   }
 
   /**
    * Check if current time is within business hours
+   * Required for TRAI compliance in India
    */
   isWithinBusinessHours() {
     const now = new Date();
@@ -53,7 +83,17 @@ class TelephonyService {
     const options = { timeZone: this.timezone, hour: 'numeric', hour12: false };
     const hour = parseInt(new Intl.DateTimeFormat('en-US', options).format(now));
 
-    return hour >= this.businessHoursStart && hour < this.businessHoursEnd;
+    const withinHours = hour >= this.businessHoursStart && hour < this.businessHoursEnd;
+
+    if (!withinHours) {
+      logger.debug('Outside business hours', {
+        currentHour: hour,
+        timezone: this.timezone,
+        allowedRange: `${this.businessHoursStart}:00 - ${this.businessHoursEnd}:00`,
+      });
+    }
+
+    return withinHours;
   }
 
   /**
@@ -83,12 +123,12 @@ class TelephonyService {
   }
 
   /**
-   * Place an outbound call to a candidate
+   * Place an outbound call to a candidate via Vobiz SIP trunk
    *
    * @param {Object} params
    * @param {string} params.interviewId - Interview record ID
    * @param {string} params.phoneNumber - Candidate's phone number (E.164 format)
-   * @param {string} params.callerIdNumber - Optional caller ID to display
+   * @param {string} params.callerIdNumber - Optional caller ID (defaults to VOBIZ_CALLER_ID)
    * @returns {Promise<Object>} Call info { roomName, sipParticipantId }
    */
   async placeCall(params) {
@@ -103,22 +143,33 @@ class TelephonyService {
       throw new Error('Phone number must be in E.164 format (e.g., +919876543210)');
     }
 
-    // Check business hours
+    // Validate India number format if calling India
+    if (phoneNumber.startsWith('+91') && phoneNumber.length !== 13) {
+      logger.warn('Invalid India phone number length', {
+        phoneNumber: `${phoneNumber.slice(0, 6)}****`,
+        length: phoneNumber.length,
+        expected: 13,
+      });
+    }
+
+    // Check business hours (TRAI compliance)
     if (!this.isWithinBusinessHours()) {
-      throw new Error('Outside business hours - calls not allowed');
+      throw new Error('Outside business hours - calls not allowed (TRAI compliance)');
     }
 
     const roomName = this.generateRoomName(interviewId);
+    const callerId = callerIdNumber || this.vobizCallerId;
 
-    logger.info('Placing outbound call', {
+    logger.info('Placing outbound call via Vobiz', {
       interviewId,
       roomName,
       phoneNumber: `${phoneNumber.slice(0, 6)}****`, // Log partial number
+      callerId: callerId ? `${callerId.slice(0, 6)}****` : 'default',
     });
 
     try {
-      // Create SIP participant (places the outbound call)
-      const sipParticipant = await this.sipClient.createSipParticipant({
+      // Create SIP participant (places the outbound call via Vobiz trunk)
+      const sipParticipantRequest = {
         sipTrunkId: this.sipTrunkId,
         sipCallTo: phoneNumber,
         roomName: roomName,
@@ -127,15 +178,18 @@ class TelephonyService {
         // Answering Machine Detection
         enableAnsweringMachineDetection: true,
         answeringMachineDetectionTimeout: 30, // seconds
-        // Optional caller ID
-        ...(callerIdNumber && {
-          sipHeaders: {
-            'P-Asserted-Identity': `<sip:${callerIdNumber}@trunk>`,
-          },
-        }),
-      });
+      };
 
-      logger.info('SIP participant created, call initiated', {
+      // Add caller ID if configured
+      if (callerId) {
+        sipParticipantRequest.sipHeaders = {
+          'P-Asserted-Identity': `<sip:${callerId}@${this.vobizSipDomain || 'trunk'}>`,
+        };
+      }
+
+      const sipParticipant = await this.sipClient.createSipParticipant(sipParticipantRequest);
+
+      logger.info('SIP participant created, call initiated via Vobiz', {
         roomName,
         sipParticipantId: sipParticipant.sipParticipantId,
       });
@@ -146,7 +200,7 @@ class TelephonyService {
         callStatus: 'dialing',
       };
     } catch (err) {
-      logger.error('Failed to place call', {
+      logger.error('Failed to place call via Vobiz', {
         interviewId,
         error: err.message,
       });
@@ -207,7 +261,7 @@ class TelephonyService {
   }
 
   /**
-   * List active SIP trunks
+   * List active SIP trunks (for debugging)
    */
   async listTrunks() {
     if (!this.sipClient) {
@@ -219,6 +273,48 @@ class TelephonyService {
       return trunks;
     } catch (err) {
       logger.error('Failed to list SIP trunks', { error: err.message });
+      throw err;
+    }
+  }
+
+  /**
+   * Create outbound trunk in LiveKit with Vobiz credentials
+   *
+   * This is typically done once during setup, not per-call.
+   * You can also do this via the LiveKit dashboard.
+   *
+   * @param {Object} vobizCredentials
+   * @param {string} vobizCredentials.sipDomain - e.g., your_domain.sip.vobiz.ai
+   * @param {string} vobizCredentials.username - Vobiz username
+   * @param {string} vobizCredentials.password - Vobiz password
+   * @param {string} vobizCredentials.phoneNumber - Your Vobiz phone number
+   */
+  async createVobizTrunk(vobizCredentials) {
+    if (!this.sipClient) {
+      throw new Error('Telephony service not initialized');
+    }
+
+    const { sipDomain, username, password, phoneNumber } = vobizCredentials;
+
+    try {
+      const trunk = await this.sipClient.createSipOutboundTrunk({
+        trunk: {
+          name: 'Vobiz India Trunk',
+          address: sipDomain,
+          authUsername: username,
+          authPassword: password,
+          numbers: [phoneNumber],
+        },
+      });
+
+      logger.info('Vobiz trunk created in LiveKit', {
+        trunkId: trunk.sipTrunkId,
+        name: trunk.name,
+      });
+
+      return trunk;
+    } catch (err) {
+      logger.error('Failed to create Vobiz trunk', { error: err.message });
       throw err;
     }
   }
