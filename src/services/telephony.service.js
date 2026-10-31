@@ -15,8 +15,17 @@
  * 3. Use trunk ID here for outbound calls
  */
 
-const { AccessToken, SipClient } = require('livekit-server-sdk');
+const { AccessToken, SipClient, RoomServiceClient } = require('livekit-server-sdk');
 const logger = require('../utils/logger');
+
+// LiveKit reports an outbound SIP call's progress in this participant attribute
+// (livekit-server-sdk 2.x has no getSipParticipant / deleteSipParticipant).
+const SIP_CALL_STATUS = {
+  dialing: 'dialing',
+  ringing: 'ringing',
+  active: 'in_progress',
+  hangup: 'completed',
+};
 
 class TelephonyService {
   constructor() {
@@ -36,7 +45,11 @@ class TelephonyService {
     this.businessHoursEnd = parseInt(process.env.BUSINESS_HOURS_END) || 21;
     this.timezone = process.env.BUSINESS_HOURS_TIMEZONE || 'Asia/Kolkata';
 
+    // How long the candidate's phone rings before LiveKit gives up (seconds)
+    this.ringingTimeoutSeconds = parseInt(process.env.CALL_RINGING_TIMEOUT_SECONDS) || 45;
+
     this.sipClient = null;
+    this.roomService = null;
   }
 
   /**
@@ -63,6 +76,7 @@ class TelephonyService {
     }
 
     this.sipClient = new SipClient(this.livekitUrl, this.apiKey, this.apiSecret);
+    this.roomService = new RoomServiceClient(this.livekitUrl, this.apiKey, this.apiSecret);
 
     logger.info('Telephony service initialized', {
       livekitUrl: this.livekitUrl,
@@ -104,9 +118,16 @@ class TelephonyService {
   }
 
   /**
-   * Generate an access token for joining a room
+   * Identity of the candidate's SIP participant in the room
    */
-  generateAccessToken(roomName, participantIdentity = 'interview-bot') {
+  candidateIdentity(interviewId) {
+    return `sip_${interviewId}`;
+  }
+
+  /**
+   * Generate an access token for joining a room (toJwt() is async in server-sdk 2.x)
+   */
+  async generateAccessToken(roomName, participantIdentity = 'interview-bot') {
     const token = new AccessToken(this.apiKey, this.apiSecret, {
       identity: participantIdentity,
     });
@@ -168,35 +189,31 @@ class TelephonyService {
     });
 
     try {
-      // Create SIP participant (places the outbound call via Vobiz trunk)
-      const sipParticipantRequest = {
-        sipTrunkId: this.sipTrunkId,
-        sipCallTo: phoneNumber,
-        roomName: roomName,
-        participantIdentity: `sip_${interviewId}`,
-        participantName: 'Candidate',
-        // Answering Machine Detection
-        enableAnsweringMachineDetection: true,
-        answeringMachineDetectionTimeout: 30, // seconds
-      };
-
-      // Add caller ID if configured
-      if (callerId) {
-        sipParticipantRequest.sipHeaders = {
-          'P-Asserted-Identity': `<sip:${callerId}@${this.vobizSipDomain || 'trunk'}>`,
-        };
-      }
-
-      const sipParticipant = await this.sipClient.createSipParticipant(sipParticipantRequest);
+      // Create SIP participant (places the outbound call via the Vobiz trunk). Returns
+      // as soon as dialing starts; answer/hang-up arrive as the sip.callStatus attribute.
+      const sipParticipant = await this.sipClient.createSipParticipant(
+        this.sipTrunkId,
+        phoneNumber,
+        roomName,
+        {
+          participantIdentity: this.candidateIdentity(interviewId),
+          participantName: 'Candidate',
+          ...(callerId && { fromNumber: callerId }),
+          ringingTimeout: this.ringingTimeoutSeconds,
+          krispEnabled: true, // noise cancellation on the candidate's line
+        }
+      );
 
       logger.info('SIP participant created, call initiated via Vobiz', {
         roomName,
-        sipParticipantId: sipParticipant.sipParticipantId,
+        sipParticipantId: sipParticipant.participantId,
+        sipCallId: sipParticipant.sipCallId,
       });
 
       return {
         roomName,
-        sipParticipantId: sipParticipant.sipParticipantId,
+        sipParticipantId: sipParticipant.participantId,
+        participantIdentity: sipParticipant.participantIdentity,
         callStatus: 'dialing',
       };
     } catch (err) {
@@ -209,59 +226,57 @@ class TelephonyService {
   }
 
   /**
-   * Get call status from LiveKit
+   * Get call status from LiveKit: the SIP participant's sip.callStatus attribute.
+   * A participant that is no longer in the room has hung up (or never connected).
    *
    * @param {string} roomName - The room name
-   * @param {string} sipParticipantId - The SIP participant ID
+   * @param {string} participantIdentity - The SIP participant's identity (sip_<interviewId>)
    */
-  async getCallStatus(roomName, sipParticipantId) {
-    if (!this.sipClient) {
+  async getCallStatus(roomName, participantIdentity) {
+    if (!this.roomService) {
       throw new Error('Telephony service not initialized');
     }
 
+    let participant;
     try {
-      const participant = await this.sipClient.getSipParticipant(sipParticipantId);
-
-      // Map LiveKit SIP status to our status values
-      const statusMap = {
-        'JOINING': 'dialing',
-        'ACTIVE': 'in_progress',
-        'DISCONNECTED': 'completed',
-        'FAILED': 'failed',
-      };
-
-      return {
-        roomName,
-        sipParticipantId,
-        status: statusMap[participant.state] || 'unknown',
-        amdResult: participant.amdResult, // 'human', 'machine', or 'unknown'
-        disconnectReason: participant.disconnectReason,
-      };
+      participant = await this.roomService.getParticipant(roomName, participantIdentity);
     } catch (err) {
+      if (err.status === 404 || /not.?found|does not exist/i.test(err.message)) {
+        return { roomName, participantIdentity, status: 'completed', disconnectReason: 'participant_gone' };
+      }
       logger.error('Failed to get call status', { roomName, error: err.message });
       throw err;
     }
+
+    const sipStatus = participant.attributes?.['sip.callStatus'];
+    return {
+      roomName,
+      participantIdentity,
+      status: SIP_CALL_STATUS[sipStatus] || 'unknown',
+      sipStatus,
+      disconnectReason: participant.disconnectReason,
+    };
   }
 
   /**
-   * Hang up a call
+   * Hang up a call (removing the SIP participant ends the phone call)
    */
-  async hangupCall(sipParticipantId) {
-    if (!this.sipClient) {
+  async hangupCall(roomName, participantIdentity) {
+    if (!this.roomService) {
       throw new Error('Telephony service not initialized');
     }
 
     try {
-      await this.sipClient.deleteSipParticipant(sipParticipantId);
-      logger.info('Call hung up', { sipParticipantId });
+      await this.roomService.removeParticipant(roomName, participantIdentity);
+      logger.info('Call hung up', { roomName, participantIdentity });
     } catch (err) {
-      logger.error('Failed to hang up call', { sipParticipantId, error: err.message });
+      logger.error('Failed to hang up call', { roomName, error: err.message });
       throw err;
     }
   }
 
   /**
-   * List active SIP trunks (for debugging)
+   * List outbound SIP trunks (for debugging)
    */
   async listTrunks() {
     if (!this.sipClient) {
@@ -269,7 +284,7 @@ class TelephonyService {
     }
 
     try {
-      const trunks = await this.sipClient.listSipTrunks();
+      const trunks = await this.sipClient.listSipOutboundTrunk();
       return trunks;
     } catch (err) {
       logger.error('Failed to list SIP trunks', { error: err.message });
@@ -297,15 +312,12 @@ class TelephonyService {
     const { sipDomain, username, password, phoneNumber } = vobizCredentials;
 
     try {
-      const trunk = await this.sipClient.createSipOutboundTrunk({
-        trunk: {
-          name: 'Vobiz India Trunk',
-          address: sipDomain,
-          authUsername: username,
-          authPassword: password,
-          numbers: [phoneNumber],
-        },
-      });
+      const trunk = await this.sipClient.createSipOutboundTrunk(
+        'Vobiz India Trunk',
+        sipDomain,
+        [phoneNumber],
+        { authUsername: username, authPassword: password }
+      );
 
       logger.info('Vobiz trunk created in LiveKit', {
         trunkId: trunk.sipTrunkId,

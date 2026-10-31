@@ -1,217 +1,106 @@
-# Pending Items - PSTN Interview Agent
+# Pending — PSTN Interview Agent, end to end
 
-## 🔴 Blockers (Must Complete Before Testing)
+Status (2026-10-31): the code is synced with the Zoom bot and passes a simulated end-to-end
+call (fake LiveKit/Deepgram/LLM/TTS/Supabase). It has **never placed a real call**. What's
+left is accounts, one database migration, the main app creating phone interviews, and
+deployment.
 
-### 1. Vobiz Account Setup (SIP Trunk Provider) ⭐
-Vobiz handles India compliance (DLT/TRAI) automatically.
+How a call works: cron finds a `mode = 'phone'` interview → claims it → LiveKit dials the
+candidate through the Vobiz SIP trunk → the bot joins the LiveKit room → on answer it greets
+and interviews (Deepgram STT → DeepSeek → Google TTS, same brain and prompt as Zoom) →
+when it ends, the transcript is written to `transcripts` → the existing report pipeline
+scores it.
 
-- [ ] Create account at [vobiz.ai](https://www.vobiz.ai)
-- [ ] Complete KYC verification (hosted by Vobiz)
-- [ ] Navigate to **SIP Trunk > Outbound Trunks > Trunks**
-- [ ] Click **Create Trunk** with name "LiveKit Integration"
-- [ ] Create or select authentication credentials
-- [ ] Save and note down:
-  - [ ] **SIP Domain**: `<your_domain>.sip.vobiz.ai` → `VOBIZ_SIP_DOMAIN`
-  - [ ] **Username** → for LiveKit trunk setup
-  - [ ] **Password** → for LiveKit trunk setup
-- [ ] Purchase a phone number for caller ID → `VOBIZ_CALLER_ID`
+---
 
-**Pricing**: ₹0.45/min for India calls, ₹600+/month for numbers
+## 1. Accounts (blockers)
 
-### 2. LiveKit Cloud Account
-- [ ] Create account at [livekit.io](https://livekit.io)
-- [ ] Create a new project
-- [ ] Get credentials from **Settings > API Keys**:
-  - [ ] **URL** → `LIVEKIT_URL` (e.g., `wss://your-project.livekit.cloud`)
-  - [ ] **API Key** → `LIVEKIT_API_KEY`
-  - [ ] **API Secret** → `LIVEKIT_API_SECRET`
+### Vobiz — India SIP trunk (the phone line)
+- [ ] Create account at vobiz.ai and complete KYC
+- [ ] SIP Trunk → Outbound Trunks → Create Trunk ("LiveKit Integration")
+- [ ] Note: SIP domain (`<x>.sip.vobiz.ai`), username, password
+- [ ] Buy a phone number for caller ID → `VOBIZ_CALLER_ID` (E.164, e.g. `+91…`)
+- [ ] Confirm with Vobiz: outbound calls to Indian mobiles from this number, DLT/TRAI
+      category for recruitment calls, and per-minute pricing
 
-### 3. Configure Vobiz Trunk in LiveKit
-- [ ] In LiveKit Dashboard, go to **Telephony > Trunks**
-- [ ] Click **Create Outbound Trunk**
-- [ ] Configure with Vobiz credentials:
-  ```
-  Name: Vobiz India Trunk
-  Address: <your_domain>.sip.vobiz.ai
-  Auth Username: <your_vobiz_username>
-  Auth Password: <your_vobiz_password>
-  Numbers: <your_vobiz_phone_number>
-  ```
-- [ ] Save and copy **Trunk ID** → `LIVEKIT_SIP_OUTBOUND_TRUNK_ID`
+### LiveKit Cloud — media server + SIP bridge
+- [ ] Create a project (pick the region nearest India) → `LIVEKIT_URL`, `LIVEKIT_API_KEY`,
+      `LIVEKIT_API_SECRET`
+- [ ] Telephony → Trunks → Create **Outbound** trunk with the Vobiz domain, username,
+      password and number → `LIVEKIT_SIP_OUTBOUND_TRUNK_ID`
+      (or call `telephonyService.createVobizTrunk()` once)
 
-### 4. Deepgram Account
-- [ ] Create account at [deepgram.com](https://deepgram.com)
-- [ ] Get API key → `DEEPGRAM_API_KEY`
-- [ ] Note: Using Nova-3 model for STT
+### Reused from the Zoom bot (no new accounts)
+Copy from the `clikhire-bot-secrets` Secret / bot `.env`:
+`DEEPGRAM_API_KEY`, `DEEPSEEK_API_KEY` (+ `DEEPSEEK_MODEL=deepseek-chat`),
+`GOOGLE_TTS_API_KEY`, `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`.
 
-### 5. DeepSeek Account
-- [ ] Create account at [platform.deepseek.com](https://platform.deepseek.com)
-- [ ] Get API key → `DEEPSEEK_API_KEY`
-- [ ] Model: `deepseek-chat`
+---
 
-### 6. Google Cloud TTS
-- [ ] Create GCP project
-- [ ] Enable **Text-to-Speech API**
-- [ ] Create service account with TTS permissions
-- [ ] Download JSON key file
-- [ ] Set `GOOGLE_APPLICATION_CREDENTIALS=/path/to/key.json`
+## 2. Database migration (Supabase — main app repo)
 
-### 7. Supabase Database Schema
-- [ ] Add phone interview columns to `interviews` table:
 ```sql
-ALTER TABLE interviews ADD COLUMN candidate_phone_number text;
-ALTER TABLE interviews ADD COLUMN call_status text DEFAULT NULL;
-  -- values: 'dialing' | 'ringing' | 'in_progress' | 'completed' | 'no_answer' | 'busy' | 'failed' | 'voicemail'
-ALTER TABLE interviews ADD COLUMN livekit_room_name text;
-ALTER TABLE interviews ADD COLUMN call_metadata jsonb DEFAULT '{}'::jsonb;
-
-CREATE INDEX idx_interviews_call_status ON interviews(call_status) WHERE mode = 'phone';
+ALTER TABLE interviews ADD COLUMN IF NOT EXISTS candidate_phone_number text;  -- E.164
+ALTER TABLE interviews ADD COLUMN IF NOT EXISTS call_status text;             -- dialing | in_progress | completed | no_answer | failed
+ALTER TABLE interviews ADD COLUMN IF NOT EXISTS livekit_room_name text;
+ALTER TABLE interviews ADD COLUMN IF NOT EXISTS call_metadata jsonb DEFAULT '{}'::jsonb;
+CREATE INDEX IF NOT EXISTS idx_interviews_phone_scheduled
+  ON interviews (scheduled_for) WHERE mode = 'phone' AND status = 'scheduled';
 ```
 
----
+No other schema change: `interviews.status` uses existing values (scheduled → in_progress →
+completed; missed / error for unanswered or failed calls), and transcripts are inserted with
+`source = 'other'`, `source_event = 'phone.call_completed'` (allowed by
+`transcripts_source_check`).
 
-## ✅ India Compliance (Handled by Vobiz)
-
-**Good news!** Vobiz handles most compliance requirements automatically:
-
-- [x] **DLT Registration** - Vobiz provides hosted KYC and DLT compliance
-- [x] **TRAI Compliance** - Built into Vobiz infrastructure
-- [x] **Number Series** - Vobiz provides compliant 140-series and toll-free numbers
-- [x] **Carrier Integration** - Instant SIP trunks with Airtel, Jio, VIL
-
-**You still need to ensure:**
-- [ ] Business hours are configured correctly (9 AM - 9 PM IST default)
-- [ ] Call recording consent is disclosed in greeting
-- [ ] LLM responses don't violate content guidelines
+- [ ] Run the migration
+- [ ] Check the Supabase database webhook on `transcripts` INSERT → `notify-analyze` has no
+      filter on `source` (the edge function itself only needs `interview_id`)
 
 ---
 
-## 🟡 Configuration Required
+## 3. Main app (clikhire) — creating phone interviews
 
-### 8. Business Hours
-Configure appropriate calling hours (default set for India):
-```env
-BUSINESS_HOURS_START=9
-BUSINESS_HOURS_END=21
-BUSINESS_HOURS_TIMEZONE=Asia/Kolkata
-```
-
-### 9. Concurrent Call Limits
-Set based on budget and trunk capacity:
-```env
-MAX_CONCURRENT_CALLS=3
-```
-
-### 10. LiveKit Webhook (Optional - for event tracking)
-- [ ] In LiveKit Dashboard, go to **Settings > Webhooks**
-- [ ] Add webhook URL: `https://your-domain.com/webhooks/livekit`
-- [ ] Enable events: `participant_joined`, `participant_left`, `room_finished`
+Nothing creates `mode = 'phone'` interviews yet. Needed:
+- [ ] A "phone screening" option when inviting / scheduling
+- [ ] Interview row: `mode = 'phone'`, `status = 'scheduled'`, `scheduled_for`,
+      `candidate_phone_number` (E.164), `interview_stage`, `duration_minutes`, and the same
+      `bot_config` as a Zoom screening (`jd_title` = topic, `candidate.first_name`,
+      `duration_minutes`; fitment: `questions`, `org_name`, `language`)
+- [ ] Candidate's phone number + consent to an AI phone call (collect on the invite)
+- [ ] Show call outcome (`call_status`: no answer / failed) in the candidate pipeline
 
 ---
 
-## 🟢 Optional / Nice-to-Have
+## 4. Deployment
 
-### 11. Inbound Calling (Phase 2)
-For candidates to call back:
-- [ ] Get LiveKit SIP URI from **Settings > Project**
-- [ ] Create inbound trunk in LiveKit
-- [ ] Configure Vobiz trunk with `inbound_destination`:
-  ```
-  PATCH https://api.vobiz.ai/api/v1/Account/{auth_id}/trunks/{trunk_id}
-  { "inbound_destination": "your-sip-uri.sip.livekit.cloud" }
-  ```
-- [ ] Create dispatch rule for inbound calls
-
-### 12. Answering Machine Detection Tuning
-- [ ] Test AMD accuracy with real calls
-- [ ] Adjust `answeringMachineDetectionTimeout` if needed
-
-### 13. Pre-call SMS/WhatsApp
-- [ ] Consider sending notification before calling
-- [ ] Reduces candidate confusion
+- [ ] Dockerfile — use a glibc image (e.g. `node:20-slim`), not Alpine:
+      `@livekit/rtc-node` ships native glibc binaries
+- [ ] Run as its own K3s Deployment next to `clikhire-bot` (same EC2), env from a ConfigMap +
+      Secret. Only outbound network is needed (HTTPS + WebRTC/UDP to LiveKit Cloud) —
+      no inbound ports except the optional `/webhooks/livekit`
+- [ ] One instance only (cron + monitor run in-process; the claim prevents double-dialing,
+      but don't run a stray copy — see the PM2 incident on the Zoom bot)
 
 ---
 
-## 💰 Cost Estimates (Updated with Vobiz)
+## 5. First live tests
 
-Per 15-minute call to India:
-
-| Component | Cost |
-|-----------|------|
-| **Vobiz SIP trunk** | ₹6.75 (~$0.08) |
-| LiveKit SIP bridging | $0.045-0.06 |
-| Deepgram STT | $0.07-0.12 |
-| Google TTS | ~$0.01 |
-| DeepSeek LLM | ~$0.02 |
-| **Total per call** | **~$0.22-0.30** |
-
-### Monthly projection:
-
-| Volume | LiveKit | Vobiz PSTN | AI Stack | Total |
-|--------|---------|------------|----------|-------|
-| 200 calls/mo | $50 (Ship) | ~₹2,000 (~$24) | ~$24 | **~$98/mo** |
-| 1,000 calls/mo | $500 (Scale) | ~₹10,000 (~$118) | ~$120 | **~$738/mo** |
+- [ ] `POST /api/calls/test` with `{ "phoneNumber": "+91…", "topic": "AI ML Basics",
+      "candidateName": "…", "durationMinutes": 3 }` to your own phone: greeting, audio
+      quality/latency both ways, answer timing, closing, hang-up
+- [ ] Not answered / rejected → interview `missed`, `call_status = no_answer`
+- [ ] Hang up mid-interview → transcript + report still generated
+- [ ] A real scheduled phone interview from the main app → report in the UI
+- [ ] Calls are blocked outside 09:00–21:00 IST (`BUSINESS_HOURS_*`)
 
 ---
 
-## 📋 Testing Checklist
+## Known gaps
 
-Once all blockers are resolved:
-
-- [ ] Run `npm install`
-- [ ] Configure `.env` from `.env.example`
-- [ ] Start server: `npm start`
-- [ ] Test health: `curl http://localhost:3000/health`
-- [ ] Place test call:
-  ```bash
-  curl -X POST http://localhost:3000/api/calls/test \
-    -H "Content-Type: application/json" \
-    -d '{"phoneNumber": "+919876543210"}'
-  ```
-- [ ] Verify:
-  - [ ] Phone rings
-  - [ ] AMD detects human vs voicemail
-  - [ ] Bot greets on answer
-  - [ ] STT transcribes candidate speech
-  - [ ] LLM generates responses
-  - [ ] TTS plays responses
-  - [ ] Call ends gracefully
-  - [ ] Transcript saved to database
-
----
-
-## ✅ Recently Implemented
-
-### Communication Skills Fallback (DONE)
-When no technical skills are provided from the database, the interview bot automatically:
-- Assesses communication skills and confidence
-- Asks about general background and career journey
-- Discusses work style preferences
-- Explores personal interests, hobbies, family (if comfortable)
-- Understands career goals and aspirations
-
-This ensures every interview is meaningful even without specific skill requirements.
-
----
-
-## 🚨 Go-Live Checklist
-
-Before production:
-
-- [ ] Vobiz account fully activated
-- [ ] Vobiz trunk tested with real Indian numbers
-- [ ] LiveKit trunk configured correctly
-- [ ] Business hours configured
-- [ ] Error alerting set up
-- [ ] Cost monitoring in place
-- [ ] Pilot with small batch (10-20 calls)
-- [ ] Review call quality / STT accuracy on phone audio
-
----
-
-## 📚 Reference Links
-
-- [Vobiz + LiveKit Integration Guide](https://vobiz.ai/docs/integrations/livekit)
-- [Vobiz Documentation](https://vobiz.ai/docs)
-- [LiveKit Telephony Docs](https://docs.livekit.io/telephony/)
-- [LiveKit SIP Trunk Setup](https://docs.livekit.io/telephony/start/sip-trunk-setup/)
+- **Voicemail:** LiveKit has no answering-machine detection here. A voicemail greeting
+  counts as the candidate speaking, so it gets a transcript and a (low) report.
+- **Proctoring:** phone calls get `multiple_speakers` only (no video, no camera).
+- **No retries:** an unanswered call is marked `missed`; re-dialing needs a new schedule.
+- **Brain sync:** `interviewBrain.service.js` is copied verbatim from the Zoom bot's
+  `voiceAgent.service.js` (see the header) — re-copy after Zoom bot changes.

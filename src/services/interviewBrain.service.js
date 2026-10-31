@@ -1,12 +1,14 @@
 /**
- * Interview Brain Service
+ * Interview Brain Service — the STT → LLM → TTS interview session.
  *
- * Transport-agnostic interview logic extracted from voiceAgent.service.js.
- * Handles: STT → LLM → TTS pipeline, greeting/closing, transcript management.
+ * SYNCED FROM clikhireBotIntegration/src/services/voiceAgent.service.js @ 2318ae1.
+ * The constants/helpers block and createSession() below are copied verbatim from that
+ * file so fixes can be carried across by copying again — don't edit them here; change
+ * the Zoom bot and re-sync. Only buildSessionConfig() (interview row -> session config)
+ * and the module wiring are PSTN-specific. Transport (LiveKit SIP) is in phoneAgent.
  *
- * Used by:
- * - phoneAgent.service.js (LiveKit SIP transport for PSTN calls)
- * - Could also be used by Zoom/Attendee transport if migrated
+ * Zoom-only behaviour is inert on phone: the camera check runs only when
+ * config.cameraLines is set, and the screening greet-fallback only when autoGreet is off.
  */
 
 const { createClient, LiveTranscriptionEvents } = require('@deepgram/sdk');
@@ -18,14 +20,15 @@ const logger = require('../utils/logger');
 const { createGoogleTTSStream } = require('./tts/googleTts.service');
 const { getLanguageConfig, getNormalizedLangCode } = require('../config/languageVoices');
 
+// ---- BEGIN verbatim from voiceAgent.service.js (module helpers) ----
 // Load interview prompt config from YAML
 const PROMPT_CONFIG_PATH = path.join(__dirname, '..', 'config', 'interviewPrompt.yaml');
 let promptConfig = {};
 try {
   promptConfig = yaml.load(fs.readFileSync(PROMPT_CONFIG_PATH, 'utf8'));
-  logger.info('Loaded interview prompt config', { path: PROMPT_CONFIG_PATH });
+  logger.info('Loaded interview prompt config', { path: PROMPT_CONFIG_PATH, promptLength: promptConfig.system_prompt?.length });
 } catch (err) {
-  logger.warn('Failed to load interview prompt config, using defaults', { error: err.message });
+  logger.warn('Failed to load interview prompt config, using .env fallback', { error: err.message });
 }
 
 // Load fitment prompt config from YAML
@@ -38,7 +41,14 @@ try {
   logger.warn('Failed to load fitment prompt config', { error: err.message });
 }
 
-const SAMPLE_RATE = 16000;
+// Default fitment questions used when bot_config provides none
+const DEFAULT_FITMENT_QUESTIONS = [
+  '1. When would you be available to start a new role?',
+  '2. What is your current notice period?',
+  '3. What are your compensation expectations for this role?',
+  '4. Are you open to relocating for this opportunity?',
+  '5. What is your preferred work model — remote, hybrid, or in-office?'
+].join('\n');
 
 /**
  * Default communication skills topics when no technical skills are provided.
@@ -82,66 +92,130 @@ function getEffectiveSkills(skills) {
   };
 }
 
+const SAMPLE_RATE = 16000;
+
 /**
  * Strip markdown and formatting artifacts so TTS speaks clean text.
+ * Removes: **bold**, *italic*, `code`, # headings, - bullets, numbered lists, etc.
  */
 function sanitizeForTTS(text) {
   return text
-    .replace(/```[\s\S]*?```/g, '')
-    .replace(/`([^`]*)`/g, '$1')
-    .replace(/#{1,6}\s*/g, '')
-    .replace(/\*{1,3}([^*]+)\*{1,3}/g, '$1')
-    .replace(/_{1,3}([^_]+)_{1,3}/g, '$1')
-    .replace(/^\s*[-*+]\s+/gm, '')
-    .replace(/^\s*\d+[.)]\s+/gm, '')
-    .replace(/\[([^\]]+)\]\([^)]+\)/g, '$1')
-    .replace(/[~]{2}([^~]+)[~]{2}/g, '$1')
-    .replace(/>\s*/g, '')
-    .replace(/\|/g, '')
-    .replace(/---+/g, '')
-    .replace(/[*#`~_]/g, '')
-    .replace(/\n{2,}/g, '. ')
-    .replace(/\n/g, ' ')
-    .replace(/\s{2,}/g, ' ')
+    .replace(/```[\s\S]*?```/g, '')      // ```code blocks``` — remove entirely
+    .replace(/`([^`]*)`/g, '$1')         // `inline code` — keep text only
+    .replace(/#{1,6}\s*/g, '')           // # headings
+    .replace(/\*{1,3}([^*]+)\*{1,3}/g, '$1') // **bold**, *italic* — extract text
+    .replace(/_{1,3}([^_]+)_{1,3}/g, '$1')   // __bold__, _italic_
+    .replace(/^\s*[-*+]\s+/gm, '')       // - bullet points at line start
+    .replace(/^\s*\d+[.)]\s+/gm, '')     // 1. numbered lists
+    .replace(/\[([^\]]+)\]\([^)]+\)/g, '$1') // [links](url) → links
+    .replace(/[~]{2}([^~]+)[~]{2}/g, '$1')  // ~~strikethrough~~
+    .replace(/>\s*/g, '')                // > blockquotes
+    .replace(/\|/g, '')                  // | table separators
+    .replace(/---+/g, '')               // --- horizontal rules
+    .replace(/[*#`~_]/g, '')             // Remove ALL remaining special chars
+    .replace(/\n{2,}/g, '. ')           // multiple newlines → sentence break
+    .replace(/\n/g, ' ')               // single newlines → space
+    .replace(/\s{2,}/g, ' ')            // collapse multiple spaces
     .trim();
 }
+
+// Hard limit on simultaneous voice sessions to prevent cost overrun
+const MAX_CONCURRENT_SESSIONS = 3;
+
+// Screening waits for the candidate to speak first. If their first words arrive before
+// STT is connected they're lost, and both sides sit silent for the whole call (empty
+// transcript, no report). Greet anyway after this long.
+const SCREENING_GREET_FALLBACK_MS = 10000;
+
+// Screening camera check (after the greeting). Camera state comes from the Zoom bot
+// (participant_status camera_on / camera_off, re-sent every 10s).
+const CAMERA_STATUS_WAIT_MS = 4000;          // extra wait for a first camera report
+const CAMERA_REMINDER_INTERVAL_MS = 20000;   // repeat the request while it stays off
+const CAMERA_MAX_WAIT_MS = 90000;            // then start the questions anyway
+
+// Screening starts wrapping up this long before the end: the next answer gets the
+// closing instead of another question.
+const WRAP_UP_BEFORE_END_MS = 60000;
+
+/** Fill {placeholders}; tidy what an empty value leaves ("Hello , welcome" -> "Hello, welcome") */
+function fillTemplate(text, values) {
+  return Object.entries(values)
+    .reduce((t, [key, value]) => t.split(`{${key}}`).join(value ?? ''), text)
+    .replace(/[ \t]+([,.])/g, '$1')
+    .replace(/,\./g, '.');
+}
+
+/** "AMAN" -> "Aman"; names already in mixed case are left alone */
+function toDisplayName(name) {
+  return (name || '').trim().split(/\s+/)
+    .map(w => (w.length > 1 && w === w.toUpperCase() ? w[0] + w.slice(1).toLowerCase() : w))
+    .join(' ');
+}
+
+// Live diarization flips single words of one voice to another speaker label ("is", "and"
+// mid-sentence) — 36 such flags in one solo test. A real second voice speaks a phrase, so
+// only a run of this many consecutive words from a non-primary speaker counts.
+const MIN_SECONDARY_RUN_WORDS = 4;
+
+/**
+ * Runs of consecutive words by a speaker other than the session's primary speaker.
+ * Primary = most words so far (not assumed to be label 0). Updates speakerWordCounts.
+ */
+function findSecondarySpeech(words, speakerWordCounts) {
+  for (const w of words) {
+    if (w.speaker !== undefined) speakerWordCounts.set(w.speaker, (speakerWordCounts.get(w.speaker) || 0) + 1);
+  }
+  let primary;
+  for (const [speaker, count] of speakerWordCounts) {
+    if (primary === undefined || count > speakerWordCounts.get(primary)) primary = speaker;
+  }
+
+  const runs = [];
+  let run = [];
+  const endRun = () => {
+    if (run.length >= MIN_SECONDARY_RUN_WORDS) runs.push({ speaker: run[0].speaker, words: run });
+    run = [];
+  };
+  for (const w of words) {
+    if (w.speaker === undefined || w.speaker === primary) { endRun(); continue; }
+    if (run.length && run[0].speaker !== w.speaker) endRun();
+    run.push(w);
+  }
+  endRun();
+  return runs;
+}
+
+// Deepgram keyterm prompting: boosts recognition of Indian hiring vocabulary that
+// nova-3 otherwise mishears ("15 lakhs" came through as "15 likes"). Only sent for
+// English sessions — keyterm is documented for English nova-3.
+const STT_KEYTERMS = [
+  'lakh', 'lakhs', 'crore', 'LPA', 'CTC', 'per annum',
+  'notice period', 'serving notice', 'immediate joiner',
+  'hybrid', 'in-office', 'work from home', 'relocate'
+];
+
+// Cap on audio held while the STT connection opens (~5 s of 16 kHz 16-bit mono).
+const MAX_PRE_STT_BUFFER_BYTES = SAMPLE_RATE * 2 * 5;
+
+// ---- END verbatim (module helpers) ----
 
 class InterviewBrainService {
   constructor() {
     this.deepgramApiKey = process.env.DEEPGRAM_API_KEY;
     this.deepseekApiKey = process.env.DEEPSEEK_API_KEY;
-    this.deepseekModel = process.env.DEEPSEEK_MODEL || 'deepseek-chat';
-
     this.defaultPrompt = promptConfig.system_prompt || process.env.BOT_SYSTEM_PROMPT || 'You are a helpful interview assistant.';
     this.defaultGreeting = promptConfig.greeting || process.env.BOT_GREETING || 'Hello! I am your interview assistant.';
+    this.defaultVoiceModel = promptConfig.voice_model || process.env.BOT_VOICE_MODEL || 'aura-2-thalia-en';
     this.defaultClosing = promptConfig.closing || 'Thank you for your time. Have a great day.';
-
     this.interviewDurationMs = (parseInt(process.env.INTERVIEW_DURATION_MINUTES) || 30) * 60 * 1000;
-
-    // Active sessions map
-    this.activeSessions = new Map();
   }
 
+  // ---- BEGIN verbatim from voiceAgent.service.js (createSession) ----
   /**
-   * Create an interview session.
-   *
-   * @param {Object} config - Session configuration
-   * @param {string} config.sessionId - Unique session identifier
-   * @param {string} config.prompt - System prompt for LLM
-   * @param {string} config.greeting - Initial greeting message
-   * @param {string} config.closing - Closing message
-   * @param {string} config.language - Language code (e.g., 'en', 'hi', 'mr')
-   * @param {string} config.skills - Skills/topics for the interview
-   * @param {boolean} config.autoGreet - Auto-greet on connection (true for phone)
-   * @param {number} config.questionCount - Number of questions (0 = unlimited/screening)
-   * @param {number} config.durationMinutes - Interview duration
-   * @param {Object} callbacks - Callback functions
-   * @param {Function} callbacks.onAudio - Called with audio buffer to send to candidate
-   * @param {Function} callbacks.onTranscriptEntry - Called with transcript entries
-   * @param {Function} callbacks.onInterviewComplete - Called when interview ends
-   * @returns {Object} Session interface { pushAudio, close, getTranscript, getProctoringData }
+   * Create a voice pipeline (STT + LLM + TTS) for a connection.
+   * Returns a session object with stt, tts, and methods to interact.
    */
-  createSession(config, callbacks) {
+  createSession(config, onAudio) {
     if (!this.deepgramApiKey) {
       throw new Error('DEEPGRAM_API_KEY is required');
     }
@@ -149,18 +223,15 @@ class InterviewBrainService {
       throw new Error('DEEPSEEK_API_KEY is required');
     }
 
-    const { onAudio, onTranscriptEntry, onInterviewComplete } = callbacks;
-    const sessionId = config.sessionId || `session-${Date.now()}`;
-
     const deepgram = createClient(this.deepgramApiKey);
     const deepseek = new OpenAI({
       baseURL: 'https://api.deepseek.com',
       apiKey: this.deepseekApiKey
     });
 
-    // Normalize language code
+    // Normalize language code from DB (ISO 639-1 like "hi", "mr") to BCP-47 ("hi-IN", "mr-IN")
+    // Default to English (en-IN) if not specified
     const normalizedLanguage = getNormalizedLangCode(config.language);
-    const languageConfig = getLanguageConfig(normalizedLanguage);
 
     // Check if skills are provided, otherwise fall back to communication skills assessment
     const { skills: effectiveSkills, isDefaultCommunication } = getEffectiveSkills(config.skills);
@@ -168,7 +239,7 @@ class InterviewBrainService {
     // Build the system prompt, appending communication skills guidance if needed
     let systemPrompt = config.prompt || this.defaultPrompt;
     if (isDefaultCommunication) {
-      logger.info('No technical skills provided, using communication skills assessment', { sessionId });
+      logger.info('No technical skills provided, using communication skills assessment', { clientId: config.clientId });
       systemPrompt = `${systemPrompt}\n\n${DEFAULT_COMMUNICATION_SKILLS_PROMPT}`;
     }
 
@@ -176,76 +247,275 @@ class InterviewBrainService {
       prompt: systemPrompt,
       greeting: config.greeting || this.defaultGreeting,
       closing: config.closing || this.defaultClosing,
-      language: normalizedLanguage,
+      voiceModel: config.voiceModel || this.defaultVoiceModel,
       skills: effectiveSkills,
-      autoGreet: config.autoGreet !== false, // Default true for phone
-      questionCount: config.questionCount || 0, // 0 = screening (unlimited)
+      language: normalizedLanguage, // Language for TTS/STT - normalized to BCP-47 (e.g., "hi-IN")
       isDefaultCommunication, // Track if we're using default communication mode
     };
 
-    // Apply language-specific greeting/closing templates
+    // Get language configuration for TTS/STT
+    const languageConfig = getLanguageConfig(sessionConfig.language);
+
+    // This branch always uses Google TTS (testing Google TTS with English before regional languages)
+    const useGoogleTTS = true;
+    logger.info('TTS provider selection', {
+      language: sessionConfig.language,
+      voice: languageConfig.ttsVoice,
+      provider: 'Google Cloud TTS'
+    });
+
+    // Override greeting and closing with language-specific versions if available
+    // Replace placeholders: {candidate_name}, {org_name}, {jd_title}, {duration_minutes}
+    // Use language-specific fallbacks to avoid mixing languages (e.g., "namaste there")
     if (languageConfig.greetingTemplate) {
-      const candidateName = config.candidateName || languageConfig.fallbackCandidateName || '';
-      sessionConfig.greeting = languageConfig.greetingTemplate
-        .replace('{candidate_name}', candidateName)
+      // Get the candidate name, using language-specific fallback or empty string
+      const candidateNameValue = config.candidateName || languageConfig.fallbackCandidateName || '';
+
+      // Build greeting - if candidateName is empty, clean up extra space/comma after greeting word
+      let greetingText = languageConfig.greetingTemplate
+        .replace('{candidate_name}', candidateNameValue)
         .replace('{org_name}', config.orgName || languageConfig.fallbackOrgName || 'our organization')
         .replace('{jd_title}', config.jdTitle || languageConfig.fallbackJdTitle || 'the position')
-        .replace('{duration_minutes}', config.durationMinutes || '5')
-        .replace(/,\s*,/g, ',')
-        .replace(/\s{2,}/g, ' ');
+        .replace('{duration_minutes}', config.durationMinutes || '5');
+
+      // Clean up greeting if candidate name was empty (removes ", ," or "  ")
+      greetingText = greetingText.replace(/,\s*,/g, ',').replace(/\s{2,}/g, ' ');
+
+      sessionConfig.greeting = greetingText;
+      logger.info('Using language-specific greeting', { language: sessionConfig.language, hasCandidateName: !!candidateNameValue });
     }
     if (languageConfig.closingTemplate) {
       sessionConfig.closing = languageConfig.closingTemplate;
+      logger.info('Using language-specific closing', { language: sessionConfig.language });
     }
 
-    // Language instruction for LLM
+    // Prepend language instruction to the system prompt if not English
+    // This tells the LLM to conduct the interview in the target language
     const languageInstruction = languageConfig.languageInstruction || '';
     const fullSystemPrompt = languageInstruction
       ? `${languageInstruction}\n\n${sessionConfig.prompt}`
       : sessionConfig.prompt;
 
+    logger.info('Language configuration applied', {
+      language: sessionConfig.language,
+      displayName: languageConfig.displayName,
+      hasLanguageInstruction: !!languageInstruction,
+      hasGreetingTemplate: !!languageConfig.greetingTemplate,
+      hasClosingTemplate: !!languageConfig.closingTemplate,
+      promptLength: fullSystemPrompt.length
+    });
+
+    // Per-session duration overrides the global default (set from DB or bot_config)
     const interviewDurationMs = config.durationMinutes
       ? config.durationMinutes * 60 * 1000
       : this.interviewDurationMs;
 
-    // Session state
-    const state = {
-      conversationHistory: [{ role: 'system', content: fullSystemPrompt }],
-      currentTranscript: '',
-      isBotSpeaking: false,
-      hasGreeted: false,
-      autoGreetTriggered: false,
-      sttReady: false,
-      ttsReady: false,
-      sttPausedUntil: 0,
-      interviewEnded: false,
-      closingSent: false,
-      completionScheduled: false,
-      isProcessingTurn: false,
-      botResponseCount: 0,
-      sessionStartTime: Date.now(),
-      interviewTranscript: [],
-      secondarySpeakerEvents: [],
-      participantEvents: [],
+    // Fitment: finite question list — close as soon as the last answer is received.
+    // 0 means unlimited (screening mode — duration timer handles the end).
+    const questionCount = config.questionCount || 0;
+    let botResponseCount = 0; // incremented each time the bot asks a question
+
+    // Conversation history for DeepSeek context (includes system message with language instruction)
+    const conversationHistory = [
+      { role: 'system', content: fullSystemPrompt }
+    ];
+
+    // Every bot turn so far. History is trimmed to the last 20 messages for latency, so
+    // without this list the model forgets its early questions and asks them again.
+    // Screening only — fitment works through a fixed question list.
+    const askedQuestions = [];
+    const recordBotTurn = (text) => {
+      conversationHistory.push({ role: 'assistant', content: text });
+      askedQuestions.push(text);
+    };
+    const llmMessages = () => {
+      if (questionCount !== 0 || askedQuestions.length === 0) return conversationHistory;
+      const asked = askedQuestions.map((q, i) => `${i + 1}. ${q}`).join('\n');
+      return [
+        conversationHistory[0],
+        {
+          role: 'system',
+          content: 'Questions you have already asked in this interview. Never ask any of these again, '
+            + 'not even reworded. Rephrasing the current question when the candidate asks for '
+            + `clarification is fine.\n${asked}`
+        },
+        ...conversationHistory.slice(1)
+      ];
     };
 
-    // Duration timer
-    const durationTimer = setTimeout(() => {
-      if (!state.closingSent) {
-        logger.info('Interview duration timer fired', { sessionId, durationMinutes: interviewDurationMs / 60000 });
-        if (state.isBotSpeaking) {
-          state.pendingClose = true;
-        } else {
+    // DeepSeek model selection - use deepseek-chat for conversational tasks
+    const deepseekModel = process.env.DEEPSEEK_MODEL || 'deepseek-chat';
+    // Screening needs variety: at 0.3 the model read the example questions out in order.
+    // Fitment stays low so the fixed questions are asked as written.
+    const llmTemperature = questionCount === 0 ? 0.7 : 0.3;
+
+    // State tracking
+    let currentTranscript = '';
+    let isBotSpeaking = false;
+    let pendingLLMAbort = null; // AbortController for cancelling in-flight LLM
+    let ttsReady = false;
+    let backupCloseTimer = null; // Resetable timer for closing after last fitment question
+    let sttReady = false;
+    let sttPausedUntil = 0; // Timestamp: don't send audio to STT until this time (echo cooldown)
+    // Audio that arrives before STT is open. The session is created by the first audio
+    // chunk — usually the candidate saying hello — so dropping it loses their first words.
+    let preSttBuffer = [];
+    let preSttBufferBytes = 0;
+    let interviewEnded = false;     // Set after LLM acknowledges last fitment answer (or duration timer fires)
+    let awaitingLastAnswer = false; // Set after last fitment question is asked — LLM still needed to acknowledge answer
+    let pendingClose = false;    // Set when timer fires while bot is mid-speech
+    let closingSent = false;     // Prevents closing from being sent more than once
+    let completionScheduled = false; // Prevents onInterviewComplete from firing twice
+    // Mutex: prevents concurrent processUserTurn executions.
+    // STT can fire multiple events while an LLM call is in-flight (UtteranceEnd + speech_final,
+    // echoes of bot audio leaking into the mixed stream, mid-utterance partials, etc.).
+    // Without this guard every overlap causes a duplicate LLM call → duplicate questions → loops.
+    let isProcessingTurn = false;
+
+    // --- Proctoring state ---
+    const secondarySpeakerEvents = []; // Detected non-primary speakers via diarization
+    const participantEvents = [];      // Camera on/off, screen share events from Zoom (sent by Attendee)
+    let lastSecondaryLogTime = 0;      // Throttle: record at most one secondary-speaker event per 5 s
+    const speakerWordCounts = new Map(); // diarization label -> words, to find the primary speaker
+
+    // --- Camera state (screening camera check) ---
+    // null until the Zoom bot reports; "on" if any non-bot participant has video on
+    // (in a screening that's the candidate).
+    const cameraByParticipant = new Map();
+    let cameraOn = null;
+    let cameraWaiters = [];          // { predicate, resolve } from waitForCamera()
+    let openingDone = false;         // camera check finished — later camera-offs get a reminder
+    let cameraBackOnPending = false; // camera went off mid-interview; remind before next question
+    const waitForCamera = (predicate, ms) => new Promise(resolve => {
+      if (predicate(cameraOn)) return resolve();
+      const waiter = { predicate, resolve: () => { clearTimeout(timer); resolve(); } };
+      const timer = setTimeout(() => {
+        cameraWaiters = cameraWaiters.filter(w => w !== waiter);
+        resolve();
+      }, Math.max(0, ms));
+      cameraWaiters.push(waiter);
+    });
+    const updateCamera = (participantId, on) => {
+      cameraByParticipant.set(participantId || 'unknown', on);
+      const wasOn = cameraOn;
+      cameraOn = [...cameraByParticipant.values()].some(Boolean);
+      if (cameraOn === wasOn) return;
+      logger.info('Candidate camera status changed', { cameraOn, participantId });
+      if (openingDone) cameraBackOnPending = cameraOn === false;
+      const ready = cameraWaiters.filter(w => w.predicate(cameraOn));
+      cameraWaiters = cameraWaiters.filter(w => !ready.includes(w));
+      ready.forEach(w => w.resolve());
+    };
+
+    // Full interview transcript log — used to build VTT when the session ends
+    const sessionStartTime = Date.now();
+    const interviewTranscript = []; // { speaker, text, timestamp_ms, duration_ms }
+
+    // --- Closing message helper ---
+    // Single place to send the closing TTS and schedule connection teardown.
+    // After closing audio plays (~25 s including TTS generation + streaming + Zoom playback),
+    // onInterviewComplete() is called to close the WebSocket so Attendee bot leaves the meeting.
+    //
+    // If the main TTS connection dropped (Deepgram closes idle connections after ~30s, which
+    // happens while the candidate answers the last question), we open a dedicated fresh
+    // TTS connection just for the closing message rather than silently skipping it.
+    const sendClosingMessage = () => {
+      if (closingSent) return;
+      closingSent = true;
+
+      const speakClosing = (ttsConn) => {
+        isBotSpeaking = true;
+        ttsConn.sendText(sessionConfig.closing);
+        ttsConn.flush();
+        interviewTranscript.push({
+          speaker: 'Interviewer',
+          text: sessionConfig.closing,
+          timestamp_ms: Date.now() - sessionStartTime,
+          duration_ms: 0
+        });
+        logger.info('Closing message sent — scheduling interview completion in 25s');
+        if (config.onInterviewComplete && !completionScheduled) {
+          completionScheduled = true;
+          setTimeout(config.onInterviewComplete, 25000);
+        }
+      };
+
+      if (ttsReady) {
+        speakClosing(tts);
+      } else {
+        // TTS connection dropped while candidate was answering.
+        // Reconnect with Google TTS for the closing message.
+        logger.warn('Google TTS dropped — reconnecting to play closing message');
+
+        const closingTts = createGoogleTTSStream({
+          language: sessionConfig.language,
+          voice: languageConfig.ttsVoiceFemale,  // Use female voice
+          sampleRate: SAMPLE_RATE,
+          gender: 'female'
+        });
+
+        closingTts.on('audio', audioData => {
+          const buffer = Buffer.from(audioData);
+          if (buffer.length > 0) onAudio(buffer);
+        });
+
+        closingTts.on('open', () => {
+          logger.info('Google Closing TTS reconnected — sending closing message');
+          speakClosing(closingTts);
+        });
+
+        closingTts.on('flushed', () => {
+          isBotSpeaking = false;
+          try { closingTts.requestClose(); } catch (e) { /* ignore */ }
+        });
+
+        closingTts.on('error', err => {
+          logger.error('Google Closing TTS error', { error: err.message });
+          if (!completionScheduled) {
+            completionScheduled = true;
+            if (config.onInterviewComplete) setTimeout(config.onInterviewComplete, 1000);
+          }
+        });
+
+        // Safety: if reconnect never opens within 8s, end call silently
+        setTimeout(() => {
+          if (!completionScheduled) {
+            logger.warn('Closing TTS failed to connect in 8s — ending call without audio');
+            completionScheduled = true;
+            if (config.onInterviewComplete) config.onInterviewComplete();
+          }
+        }, 8000);
+      }
+    };
+
+    // --- Backup close timer (fitment: after last question is asked) ---
+    // Resets whenever STT fires after interviewEnded, so a candidate who is actively
+    // answering but whose audio got caught in the 1s echo-cooldown window gets more time.
+    // 90s window (was 45s) — shorter answers finish well within this.
+    const BACKUP_CLOSE_MS = 90000;
+    const scheduleBackupClose = () => {
+      if (backupCloseTimer) clearTimeout(backupCloseTimer);
+      backupCloseTimer = setTimeout(() => {
+        backupCloseTimer = null;
+        if (!closingSent) {
+          interviewEnded = true;
+          logger.info('Backup timer: no candidate answer — sending closing', { questionCount, botResponseCount });
           sendClosingMessage();
         }
-      }
-    }, interviewDurationMs);
+      }, BACKUP_CLOSE_MS);
+    };
 
-    // --- STT Setup (Deepgram) ---
+    // --- STT (Deepgram Live Transcription) ---
+    // endpointing / utterance_end_ms are tuned per mode:
+    //   fitment  — tighter (400ms / 2s): answers are short, less thinking time needed
+    //   screening — looser (800ms / 5s): candidates pause to think during technical questions
+    // Use language-specific STT model (e.g., 'hi' for Hindi, 'mr' for Marathi)
     const sttLanguage = languageConfig.sttLanguage || 'en';
+    logger.info('STT language configuration', { sttLanguage, configLanguage: sessionConfig.language });
+
     const stt = deepgram.listen.live({
       model: 'nova-3',
-      language: sttLanguage,
+      language: sttLanguage,  // Use language from config (hi, mr, te, ta, etc.)
       smart_format: true,
       encoding: 'linear16',
       sample_rate: SAMPLE_RATE,
@@ -253,364 +523,859 @@ class InterviewBrainService {
       utterance_end_ms: config.sttUtteranceEndMs || 5000,
       vad_events: true,
       endpointing: config.sttEndpointing || 800,
-      diarize: true,
+      diarize: true, // Enable speaker diarization to detect secondary speakers (proctoring)
+      ...(sttLanguage.startsWith('en') && { keyterm: STT_KEYTERMS })
     });
 
     stt.on(LiveTranscriptionEvents.Open, () => {
-      state.sttReady = true;
-      logger.info('STT connection opened', { sessionId, language: sttLanguage });
+      sttReady = true;
+      logger.info('Deepgram STT connection opened', { bufferedAudioBytes: preSttBufferBytes });
+      for (const chunk of preSttBuffer) stt.send(chunk);
+      preSttBuffer = [];
+      preSttBufferBytes = 0;
       checkAutoGreet();
     });
 
     stt.on(LiveTranscriptionEvents.Error, err => {
-      logger.error('STT error', { sessionId, error: err.message });
+      logger.error('Deepgram STT error', { error: err.message || err });
     });
 
     stt.on(LiveTranscriptionEvents.Close, () => {
-      state.sttReady = false;
-      logger.info('STT connection closed', { sessionId });
+      sttReady = false;
+      logger.info('Deepgram STT connection closed');
     });
 
-    stt.on(LiveTranscriptionEvents.Transcript, async (data) => {
-      if (state.interviewEnded) return;
-      if (Date.now() < state.sttPausedUntil) return;
-
-      const transcript = data.channel?.alternatives?.[0]?.transcript || '';
-      if (!transcript) return;
-
-      // Accumulate transcript
-      state.currentTranscript += ' ' + transcript;
-      state.currentTranscript = state.currentTranscript.trim();
-
-      // Process on speech_final or utterance_end
-      if (data.is_final && data.speech_final) {
-        await processUserTurn();
-      }
+    // --- TTS (Google Cloud TTS) ---
+    // This branch uses Google TTS for all interviews (English default)
+    // to test Google TTS before adding regional languages
+    logger.info('Initializing Google Cloud TTS', {
+      language: sessionConfig.language,
+      voice: languageConfig.ttsVoice
     });
 
-    stt.on(LiveTranscriptionEvents.UtteranceEnd, async () => {
-      if (state.currentTranscript.trim() && !state.isProcessingTurn) {
-        await processUserTurn();
-      }
-    });
-
-    // --- TTS Setup (Google Cloud) ---
     const tts = createGoogleTTSStream({
       language: sessionConfig.language,
-      voice: languageConfig.ttsVoiceFemale,
+      voice: languageConfig.ttsVoiceFemale,  // Use female voice
       sampleRate: SAMPLE_RATE,
-      gender: 'female',
+      gender: 'female'
     });
 
     tts.on('open', () => {
-      state.ttsReady = true;
-      logger.info('TTS connection opened', { sessionId });
+      ttsReady = true;
+      logger.info('Google TTS connection opened');
       checkAutoGreet();
     });
 
     tts.on('audio', audioData => {
       const buffer = Buffer.from(audioData);
-      if (buffer.length > 0) onAudio(buffer);
+      if (buffer.length > 0) {
+        onAudio(buffer);
+      }
     });
 
     tts.on('flushed', () => {
-      state.isBotSpeaking = false;
-      // Echo cooldown
-      const echoCooldownMs = sessionConfig.questionCount === 0 ? 2500 : 500;
-      state.sttPausedUntil = Date.now() + echoCooldownMs;
-      state.currentTranscript = '';
-      logger.info('TTS flushed, echo cooldown active', { sessionId, cooldownMs: echoCooldownMs });
+      isBotSpeaking = false;
+      // After bot finishes speaking, pause STT briefly to avoid echo feedback.
+      // Screening mode needs a longer cooldown (2.5s) because the audio path is
+      // longer and bot voice leaks back into STT more easily, causing repeated questions.
+      // Fitment mode reduced to 500ms for faster response (short answers, less echo risk).
+      // Flushed now fires when playback actually ends (it used to fire as soon as the audio
+      // was sent), so 2500ms here clipped the first words of every screening answer.
+      const echoCooldownMs = questionCount === 0 ? 800 : 500;
+      sttPausedUntil = Date.now() + echoCooldownMs;
+      currentTranscript = ''; // Discard any transcript accumulated during bot speech
+      logger.info(`Google TTS flushed — bot done speaking, STT paused for ${echoCooldownMs}ms cooldown`);
 
-      if (state.pendingClose && !state.closingSent) {
-        state.pendingClose = false;
+      // If the duration timer fired while bot was mid-speech, send closing now
+      if (pendingClose && !closingSent) {
+        pendingClose = false;
+        logger.info('Sending deferred closing message (timer fired during bot speech)');
         sendClosingMessage();
       }
     });
 
     tts.on('error', err => {
-      logger.error('TTS error', { sessionId, error: err.message });
+      logger.error('Google TTS error', { error: err.message || err });
+      // A failed synthesis never emits 'flushed', so without this isBotSpeaking stays
+      // true forever: STT is gated off, the bot goes deaf and mute, and any deferred
+      // closing never plays.
+      isBotSpeaking = false;
+      if (pendingClose && !closingSent) {
+        pendingClose = false;
+        sendClosingMessage();
+      }
     });
 
     tts.on('close', () => {
-      state.ttsReady = false;
-      state.isBotSpeaking = false;
-      logger.info('TTS connection closed', { sessionId });
+      ttsReady = false;
+      isBotSpeaking = false; // Safety: unblock STT if TTS closes unexpectedly mid-speech
+      // If we were waiting to close after the last question, trigger it now
+      // (sendClosingMessage will reconnect TTS since ttsReady = false)
+      if (pendingClose && !closingSent) {
+        pendingClose = false;
+        sendClosingMessage();
+      }
+      logger.info('Google TTS connection closed');
     });
 
-    // --- Helper Functions ---
-    const checkAutoGreet = () => {
-      if (sessionConfig.autoGreet && state.sttReady && state.ttsReady && !state.autoGreetTriggered) {
-        triggerGreeting();
+    // NOTE: Barge-in is disabled because realtime_audio.mixed contains the bot's
+    // own TTS output. VAD would fire on the bot's own voice, creating a feedback
+    // loop that aborts every response. With mixed audio, we cannot distinguish
+    // between user speech and bot echo.
+
+    // Speak one line and resolve when it has finished playing ('flushed' fires at playback
+    // end). Timeout covers a TTS that never flushes.
+    const speakAndWait = (text) => new Promise(resolve => {
+      const clean = text ? sanitizeForTTS(text) : '';
+      if (!clean || !ttsReady) return resolve();
+      const done = () => {
+        clearTimeout(timer);
+        tts.removeListener('flushed', done);
+        resolve();
+      };
+      const timer = setTimeout(done, clean.length * 80 + 3000);
+      tts.on('flushed', done);
+      isBotSpeaking = true;
+      tts.sendText(clean);
+      tts.flush();
+      interviewTranscript.push({
+        speaker: 'Interviewer',
+        text: clean,
+        timestamp_ms: Date.now() - sessionStartTime,
+        duration_ms: 0
+      });
+    });
+
+    // Screening opening, after the greeting: thank the candidate if their camera is on;
+    // otherwise ask for it and wait (with reminders) before the first question.
+    const runCameraCheck = async () => {
+      const lines = config.cameraLines;
+      if (!lines) return;
+      try {
+        if (cameraOn === null) await waitForCamera(on => on !== null, CAMERA_STATUS_WAIT_MS);
+        if (cameraOn === null) {
+          logger.info('Camera status unavailable — asking candidate to keep it on');
+          await speakAndWait(lines.unknown);
+          return;
+        }
+        if (!cameraOn) {
+          logger.info('Candidate camera off at start — asking them to turn it on');
+          await speakAndWait(lines.request);
+          const deadline = Date.now() + CAMERA_MAX_WAIT_MS;
+          while (!cameraOn && !closingSent && Date.now() < deadline) {
+            await waitForCamera(on => on === true, Math.min(CAMERA_REMINDER_INTERVAL_MS, deadline - Date.now()));
+            if (!cameraOn && !closingSent && Date.now() < deadline) await speakAndWait(lines.reminder);
+          }
+          if (!cameraOn) {
+            logger.warn('Candidate camera still off — starting questions anyway', { waitedMs: CAMERA_MAX_WAIT_MS });
+            await speakAndWait(lines.proceed);
+            return;
+          }
+        }
+        await speakAndWait(lines.thanks);
+      } finally {
+        openingDone = true;
       }
     };
 
+    // Track whether we've greeted the candidate yet.
+    let hasGreeted = false;
+    let autoGreetTriggered = false; // prevents duplicate auto-greet if both STT+TTS open simultaneously
+    let screeningGreetTimer = null; // Fallback greet for screening if the candidate never speaks
+
+    // Shared greeting + first-question sequence.
+    // Called either by processUserTurn (candidate speaks first — screening)
+    // or by checkAutoGreet (auto-greet — fitment mode, bot speaks first).
     const triggerGreeting = async () => {
-      if (state.hasGreeted || state.autoGreetTriggered) return;
-      state.autoGreetTriggered = true;
-      state.hasGreeted = true;
-      logger.info('Triggering greeting', { sessionId });
+      if (hasGreeted || autoGreetTriggered) return;
+      autoGreetTriggered = true;
+      hasGreeted = true;
+      logger.info('Triggering greeting and first question', { autoGreet: config.autoGreet });
 
       try {
-        state.isBotSpeaking = true;
-        tts.sendText(sessionConfig.greeting);
-        tts.flush();
+        isBotSpeaking = true;
+        let firstQuestion = '';
 
-        state.interviewTranscript.push({
-          speaker: 'Interviewer',
-          text: sessionConfig.greeting,
-          timestamp_ms: Date.now() - state.sessionStartTime,
-        });
+        if (ttsReady) {
+          logger.info('Speaking greeting via TTS', { greeting: sessionConfig.greeting, greetingLength: sessionConfig.greeting.length });
 
-        if (onTranscriptEntry) {
-          onTranscriptEntry({ speaker: 'Interviewer', text: sessionConfig.greeting });
-        }
-
-        // Get first question from LLM
-        state.conversationHistory.push({ role: 'user', content: 'Begin the interview. Ask the first question now.' });
-
-        const stream = await deepseek.chat.completions.create({
-          model: this.deepseekModel,
-          messages: state.conversationHistory,
-          max_tokens: 256,
-          temperature: 0.3,
-          stream: true,
-        });
-
-        let fullResponse = '';
-        for await (const chunk of stream) {
-          const content = chunk.choices[0]?.delta?.content || '';
-          fullResponse += content;
-        }
-
-        fullResponse = sanitizeForTTS(fullResponse.trim());
-        if (fullResponse) {
-          state.conversationHistory.push({ role: 'assistant', content: fullResponse });
-          state.botResponseCount++;
-
-          // Wait for greeting to finish before first question
-          const greetingChars = sessionConfig.greeting.length;
-          const waitMs = Math.min(Math.ceil(greetingChars * 60) + 500, 20000);
-          await new Promise(r => setTimeout(r, waitMs));
-
-          tts.sendText(fullResponse);
-          tts.flush();
-
-          state.interviewTranscript.push({
-            speaker: 'Interviewer',
-            text: fullResponse,
-            timestamp_ms: Date.now() - state.sessionStartTime,
+          // Generate Q1 while the greeting plays. The greeting is recorded in the
+          // transcript as it's sent, so it's kept even if the LLM call fails.
+          conversationHistory.push({ role: 'user', content: 'Begin the interview. Ask the first question now.' });
+          const llmPromise = deepseek.chat.completions.create({
+            model: deepseekModel,
+            messages: llmMessages(),
+            max_tokens: 256,
+            temperature: llmTemperature,
+            stream: true
           });
+          const [, stream] = await Promise.all([speakAndWait(sessionConfig.greeting), llmPromise]);
 
-          if (onTranscriptEntry) {
-            onTranscriptEntry({ speaker: 'Interviewer', text: fullResponse });
+          // Collect first question from LLM stream
+          for await (const chunk of stream) {
+            const delta = chunk.choices[0]?.delta?.content;
+            if (delta) firstQuestion += delta;
+          }
+          // Add assistant response to history
+          if (firstQuestion) {
+            recordBotTurn(firstQuestion);
+          }
+
+          await runCameraCheck();
+          if (closingSent) return;
+        } else {
+          // No TTS - still need to get first question from LLM
+          conversationHistory.push({ role: 'user', content: 'Begin the interview. Ask the first question now.' });
+          const stream = await deepseek.chat.completions.create({
+            model: deepseekModel,
+            messages: llmMessages(),
+            max_tokens: 256,
+            temperature: llmTemperature,
+            stream: true
+          });
+          for await (const chunk of stream) {
+            const delta = chunk.choices[0]?.delta?.content;
+            if (delta) firstQuestion += delta;
+          }
+          if (firstQuestion) {
+            recordBotTurn(firstQuestion);
+          }
+        }
+
+        if (firstQuestion) {
+          const clean = sanitizeForTTS(firstQuestion);
+          if (clean) {
+            // Guard TTS send — if TTS dropped during the greeting sleep, skip the send
+            // but still count the question so the interview state stays consistent.
+            if (ttsReady) {
+              isBotSpeaking = true;
+              logger.info('Sending first question to TTS', { question: clean, questionLength: clean.length });
+              tts.sendText(clean);
+              tts.flush();
+            } else {
+              logger.warn('TTS not ready when Q1 generated — question skipped, interview may proceed silently');
+            }
+
+            botResponseCount++; // Q1 asked (or attempted)
+            interviewTranscript.push({
+              speaker: 'Interviewer',
+              text: firstQuestion,   // Q1 as its own entry — greeting already pushed above
+              timestamp_ms: Date.now() - sessionStartTime,
+              duration_ms: 0
+            });
+
+            // If Q1 is also the LAST question (questionCount = 1), wait for candidate answer
+            if (questionCount > 0 && botResponseCount >= questionCount && !closingSent) {
+              logger.info('Q1 is the only fitment question — waiting for candidate answer before closing');
+              awaitingLastAnswer = true;
+              scheduleBackupClose();
+            }
           }
         }
       } catch (err) {
-        logger.error('Error in greeting sequence', { sessionId, error: err.message });
+        logger.error('Error in greeting/first question flow', { error: err.message });
+        isBotSpeaking = false;
       }
     };
 
-    const processUserTurn = async () => {
-      if (state.isProcessingTurn || state.interviewEnded) return;
-      if (!state.currentTranscript.trim()) return;
-
-      state.isProcessingTurn = true;
-      const userText = state.currentTranscript.trim();
-      state.currentTranscript = '';
-
-      logger.info('Processing user turn', { sessionId, textLength: userText.length });
-
-      // Trigger greeting if not yet done
-      if (!state.hasGreeted) {
-        state.isProcessingTurn = false;
+    // --- Auto-greet trigger (fitment mode: bot speaks first) ---
+    // Called from both STT.Open and TTS.Open so it fires as soon as both are ready,
+    // whichever opens last. Uses the isProcessingTurn mutex so candidate audio during
+    // the greeting sequence is safely blocked.
+    const runGreeting = async () => {
+      if (hasGreeted || autoGreetTriggered) return;
+      if (isProcessingTurn) return;       // another call beat us here
+      isProcessingTurn = true;
+      try {
         await triggerGreeting();
+      } finally {
+        isProcessingTurn = false;
+      }
+    };
+
+    const checkAutoGreet = async () => {
+      if (hasGreeted || autoGreetTriggered) return;
+      if (!sttReady || !ttsReady) return; // wait until both connections are up
+      if (!config.autoGreet) {
+        // Screening: candidate speaks first, but don't wait forever.
+        if (!screeningGreetTimer) {
+          screeningGreetTimer = setTimeout(() => {
+            screeningGreetTimer = null;
+            if (hasGreeted || autoGreetTriggered) return;
+            logger.info('Screening: candidate has not spoken — greeting first', { waitedMs: SCREENING_GREET_FALLBACK_MS });
+            runGreeting();
+          }, SCREENING_GREET_FALLBACK_MS);
+        }
+        return;
+      }
+      await runGreeting();
+    };
+
+    // --- Process transcripts → LLM → TTS ---
+    const processUserTurn = async (userText) => {
+      if (!userText.trim()) return;
+      if (interviewEnded) {
+        // Candidate spoke after LLM already acknowledged last fitment answer (or after duration timer).
+        // Don't call LLM again — closing is either already in progress or needs triggering.
+        // Still record what they said: this is often their answer to the final question,
+        // finished after time ran out, and dropping it left it out of the report.
+        if (!closingSent) {
+          interviewTranscript.push({
+            speaker: 'Candidate',
+            text: userText,
+            timestamp_ms: Date.now() - sessionStartTime,
+            duration_ms: 0
+          });
+        }
+        if (!closingSent) {
+          if (!isBotSpeaking) {
+            if (backupCloseTimer) { clearTimeout(backupCloseTimer); backupCloseTimer = null; }
+            logger.info('Candidate spoke after interview ended — sending closing');
+            sendClosingMessage();
+          } else {
+            pendingClose = true;
+            logger.info('Candidate spoke after interview ended while bot still speaking — deferring close');
+          }
+        }
         return;
       }
 
-      try {
-        state.interviewTranscript.push({
-          speaker: 'Candidate',
-          text: userText,
-          timestamp_ms: Date.now() - state.sessionStartTime,
-        });
-
-        if (onTranscriptEntry) {
-          onTranscriptEntry({ speaker: 'Candidate', text: userText });
-        }
-
-        state.conversationHistory.push({ role: 'user', content: userText });
-
-        // Check if we've asked all questions (fitment mode)
-        if (sessionConfig.questionCount > 0 && state.botResponseCount >= sessionConfig.questionCount) {
-          state.interviewEnded = true;
-          // Acknowledge final answer then close
-          const ackStream = await deepseek.chat.completions.create({
-            model: this.deepseekModel,
-            messages: [...state.conversationHistory, { role: 'user', content: 'Acknowledge this answer briefly, then say goodbye.' }],
-            max_tokens: 128,
-            temperature: 0.3,
-            stream: true,
-          });
-
-          let ackResponse = '';
-          for await (const chunk of ackStream) {
-            ackResponse += chunk.choices[0]?.delta?.content || '';
-          }
-
-          ackResponse = sanitizeForTTS(ackResponse.trim());
-          if (ackResponse) {
-            state.isBotSpeaking = true;
-            tts.sendText(ackResponse);
-            tts.flush();
-
-            state.interviewTranscript.push({
-              speaker: 'Interviewer',
-              text: ackResponse,
-              timestamp_ms: Date.now() - state.sessionStartTime,
-            });
-          }
-
-          // Schedule closing after acknowledgment
-          setTimeout(sendClosingMessage, 5000);
-          state.isProcessingTurn = false;
-          return;
-        }
-
-        // Get next question from LLM
-        const stream = await deepseek.chat.completions.create({
-          model: this.deepseekModel,
-          messages: state.conversationHistory,
-          max_tokens: 256,
-          temperature: 0.3,
-          stream: true,
-        });
-
-        let fullResponse = '';
-        for await (const chunk of stream) {
-          fullResponse += chunk.choices[0]?.delta?.content || '';
-        }
-
-        fullResponse = sanitizeForTTS(fullResponse.trim());
-        if (fullResponse) {
-          state.conversationHistory.push({ role: 'assistant', content: fullResponse });
-          state.botResponseCount++;
-          state.isBotSpeaking = true;
-
-          tts.sendText(fullResponse);
-          tts.flush();
-
-          state.interviewTranscript.push({
-            speaker: 'Interviewer',
-            text: fullResponse,
-            timestamp_ms: Date.now() - state.sessionStartTime,
-          });
-
-          if (onTranscriptEntry) {
-            onTranscriptEntry({ speaker: 'Interviewer', text: fullResponse });
-          }
-        }
-      } catch (err) {
-        logger.error('Error processing user turn', { sessionId, error: err.message });
-      } finally {
-        state.isProcessingTurn = false;
+      // Mutex: drop this event if a turn is already being processed.
+      // Covers: UtteranceEnd firing after speech_final for the same utterance,
+      // bot-audio echoes leaking into STT via the mixed stream, rapid re-triggers, etc.
+      if (isProcessingTurn) {
+        logger.info('Dropping overlapping STT event — turn already in progress', { text: userText.substring(0, 60) });
+        return;
       }
-    };
+      isProcessingTurn = true;
 
-    const sendClosingMessage = () => {
-      if (state.closingSent) return;
-      state.closingSent = true;
-      state.interviewEnded = true;
+      try {
 
-      logger.info('Sending closing message', { sessionId });
+      logger.info('User said', { text: userText });
 
-      state.isBotSpeaking = true;
-      tts.sendText(sessionConfig.closing);
-      tts.flush();
-
-      state.interviewTranscript.push({
-        speaker: 'Interviewer',
-        text: sessionConfig.closing,
-        timestamp_ms: Date.now() - state.sessionStartTime,
+      // Record user utterance in interview transcript
+      const userTimestamp = Date.now() - sessionStartTime;
+      interviewTranscript.push({
+        speaker: 'Candidate',
+        text: userText,
+        timestamp_ms: userTimestamp,
+        duration_ms: 0
       });
 
-      if (onTranscriptEntry) {
-        onTranscriptEntry({ speaker: 'Interviewer', text: sessionConfig.closing });
+      // If this is the first user message and we haven't greeted yet
+      // (covers screening mode where candidate speaks first; fitment uses auto-greet instead)
+      if (!hasGreeted) {
+        await triggerGreeting();
+        return; // Don't process "hi/hello" as a real answer
       }
 
-      // Schedule completion after closing plays
-      if (!state.completionScheduled) {
-        state.completionScheduled = true;
-        setTimeout(() => {
-          logger.info('Interview complete', { sessionId });
-          if (onInterviewComplete) onInterviewComplete();
-        }, 25000);
-      }
-    };
+      // Check if interview duration has been reached — wrap up gracefully
+      const elapsedMs = Date.now() - sessionStartTime;
+      if (elapsedMs >= interviewDurationMs && !closingSent) {
+        interviewEnded = true;
+        logger.info('Interview duration reached, wrapping up', {
+          elapsedMinutes: Math.floor(elapsedMs / 60000),
+          durationMinutes: Math.floor(interviewDurationMs / 60000)
+        });
 
-    // Session interface
-    const session = {
-      sessionId,
-
-      /**
-       * Push raw audio (16-bit PCM, 16kHz) from the candidate
-       */
-      pushAudio: (audioBuffer) => {
-        if (state.sttReady && !state.interviewEnded) {
-          stt.send(audioBuffer);
+        if (isBotSpeaking) {
+          pendingClose = true;
+          logger.info('Bot is mid-speech, deferring closing until current utterance ends');
+        } else {
+          sendClosingMessage();
         }
-      },
+        return;
+      }
 
-      /**
-       * Close the session
-       */
-      close: () => {
-        clearTimeout(durationTimer);
-        try { stt.requestClose(); } catch (e) {}
-        try { tts.requestClose(); } catch (e) {}
-        this.activeSessions.delete(sessionId);
-        logger.info('Session closed', { sessionId });
-      },
+      // Last minute of a screening: this answer gets the closing, not another question
+      if (wrapUpRequested && !closingSent) {
+        interviewEnded = true;
+        logger.info('Wrap-up window — closing after the candidate\'s answer', {
+          remainingSeconds: Math.round((interviewDurationMs - elapsedMs) / 1000)
+        });
+        if (isBotSpeaking) pendingClose = true; else sendClosingMessage();
+        return;
+      }
 
-      /**
-       * Get the full transcript
-       */
-      getTranscript: () => [...state.interviewTranscript],
+      // Keep conversation history manageable (last 20 exchanges, but always keep system message)
+      if (conversationHistory.length > 21) {
+        // Keep system message (index 0) and last 20 messages
+        const systemMsg = conversationHistory[0];
+        conversationHistory.splice(0, conversationHistory.length - 20);
+        conversationHistory.unshift(systemMsg);
+      }
 
-      /**
-       * Get proctoring data
-       */
-      getProctoringData: () => ({
-        secondarySpeakerEvents: [...state.secondarySpeakerEvents],
-        participantEvents: [...state.participantEvents],
-      }),
+      // Add user message to conversation history
+      conversationHistory.push({ role: 'user', content: userText });
+
+      // Stream LLM response with retry on rate limit errors.
+      const APP_RETRY_DELAY_MS = 3000;
+      const APP_MAX_RETRIES = 1;
+      let fullResponse = null;
+      // Track whether we actually sent a flush to TTS.
+      // When true, TTS Flushed is the ONLY correct place to reset isBotSpeaking —
+      // resetting it here (before Flushed fires) allows bot's own TTS audio to leak
+      // back into STT via the mixed audio stream, causing echo-driven extra LLM calls
+      // and question loops.
+      let ttsFlushSent = false;
+
+      for (let attempt = 0; attempt <= APP_MAX_RETRIES; attempt++) {
+        try {
+          isBotSpeaking = true;
+          const abortController = new AbortController();
+          pendingLLMAbort = abortController;
+
+          // Timing: track LLM response time
+          const llmStartTime = Date.now();
+
+          // Call DeepSeek API with streaming
+          const stream = await deepseek.chat.completions.create({
+            model: deepseekModel,
+            messages: llmMessages(),
+            max_tokens: 256,
+            temperature: llmTemperature,
+            stream: true
+          }, { signal: abortController.signal });
+
+          const llmFirstChunkTime = Date.now();
+          logger.info('LLM stream started', { latencyMs: llmFirstChunkTime - llmStartTime });
+
+          let response = '';
+
+          // Buffer the full LLM response before sending to TTS.
+          // Streaming chunk-by-chunk causes uneven audio (fast/slow, dropped words)
+          // because TTS has to synthesize tiny fragments with network latency gaps.
+          for await (const chunk of stream) {
+            if (abortController.signal.aborted) {
+              logger.info('LLM stream aborted');
+              break;
+            }
+
+            const delta = chunk.choices[0]?.delta?.content;
+            if (delta) response += delta;
+          }
+
+          const llmEndTime = Date.now();
+          logger.info('LLM response complete', {
+            totalLatencyMs: llmEndTime - llmStartTime,
+            streamDurationMs: llmEndTime - llmFirstChunkTime,
+            responseLength: response.length
+          });
+
+          // Add assistant response to conversation history
+          if (response) {
+            recordBotTurn(response);
+          }
+
+          // Send the complete response to TTS in one go for smooth audio
+          if (ttsReady && !abortController.signal.aborted && response) {
+            let clean = sanitizeForTTS(response);
+            if (clean && cameraBackOnPending && config.cameraLines?.backOn && cameraOn === false) {
+              cameraBackOnPending = false;
+              logger.info('Camera off mid-interview — reminding before next question');
+              interviewTranscript.push({
+                speaker: 'Interviewer',
+                text: config.cameraLines.backOn,
+                timestamp_ms: Date.now() - sessionStartTime,
+                duration_ms: 0
+              });
+              clean = `${sanitizeForTTS(config.cameraLines.backOn)} ${clean}`;
+            }
+            if (clean) {
+              tts.sendText(clean);
+              tts.flush();
+              ttsFlushSent = true;
+            }
+          }
+
+          pendingLLMAbort = null;
+          fullResponse = response;
+          break; // Success — exit retry loop
+
+        } catch (err) {
+          pendingLLMAbort = null;
+
+          if (err.name === 'AbortError') {
+            logger.info('LLM request aborted');
+            break;
+          }
+
+          const isRateLimit = err.status === 429
+            || err.message?.includes('429')
+            || err.message?.includes('rate_limit');
+
+          if (isRateLimit && attempt < APP_MAX_RETRIES) {
+            logger.warn('DeepSeek rate limited, retrying after delay', {
+              attempt: attempt + 1,
+              maxRetries: APP_MAX_RETRIES,
+              delayMs: APP_RETRY_DELAY_MS
+            });
+            isBotSpeaking = false;
+            await new Promise(resolve => setTimeout(resolve, APP_RETRY_DELAY_MS));
+            continue;
+          }
+
+          logger.error('Error in LLM processing', { error: err.message, isRateLimit, attempt });
+          break;
+        }
+      }
+
+      if (fullResponse) {
+        botResponseCount++; // another question asked
+        logger.info('Bot responded', { text: fullResponse, textLength: fullResponse.length, botResponseCount, questionCount });
+        const botTimestamp = Date.now() - sessionStartTime;
+        interviewTranscript.push({
+          speaker: 'Interviewer',
+          text: fullResponse,
+          timestamp_ms: botTimestamp,
+          duration_ms: 0
+        });
+
+        if (questionCount > 0 && !closingSent) {
+          if (botResponseCount > questionCount) {
+            // LLM just acknowledged the candidate's last answer ("Perfect, thanks so much.").
+            // Close after TTS finishes speaking the acknowledgment.
+            logger.info('LLM acknowledged last fitment answer — closing after TTS', { questionCount, botResponseCount });
+            interviewEnded = true;
+            pendingClose = true;
+          } else if (botResponseCount >= questionCount) {
+            // Just asked the last fitment question — wait for candidate to answer.
+            // LLM still needs to run once more to give the closing acknowledgment.
+            logger.info('Last fitment question asked — waiting for candidate answer', { questionCount, botResponseCount });
+            awaitingLastAnswer = true;
+            scheduleBackupClose();
+          }
+        }
+      } else if (!interviewEnded) {
+        // All retries failed — speak fallback so the user doesn't hear silence
+        isBotSpeaking = true;
+        const fallback = 'Sorry, could you repeat that?';
+        if (ttsReady) {
+          tts.sendText(fallback);
+          tts.flush();
+          ttsFlushSent = true;
+        }
+        logger.warn('LLM failed after retries, spoke fallback message');
+      }
+
+      // Only reset isBotSpeaking here when no TTS flush was sent.
+      // When flush WAS sent, the TTS Flushed event resets it after audio finishes — doing
+      // it here before Flushed fires lets bot audio echo into STT via the mixed stream.
+      if (!ttsFlushSent) {
+        isBotSpeaking = false;
+      }
+
+      } finally {
+        isProcessingTurn = false;
+      }
     };
 
-    this.activeSessions.set(sessionId, session);
+    // --- Answer grace period ---
+    // speech_final fires after `endpointing` ms of silence, which is shorter than a
+    // natural mid-answer pause ("It is... around 30 days"). Answering immediately cut
+    // candidates off and the transcript recorded fragments. Instead, wait answerGraceMs
+    // more; if they resume speaking the timer is cancelled and the answer keeps growing.
+    const answerGraceMs = config.answerGraceMs || 2000;
+    let answerGraceTimer = null;
+    let lastCandidateSpeechAt = 0; // Last STT words (interim or final) — "is the candidate talking?"
+
+    const commitAnswer = (trigger) => {
+      if (answerGraceTimer) { clearTimeout(answerGraceTimer); answerGraceTimer = null; }
+      const userText = currentTranscript.trim();
+      if (!userText) return;
+      // Same gate as sendAudio(): text that surfaces while the bot is talking is echo
+      if (isBotSpeaking || Date.now() < sttPausedUntil) {
+        logger.info('Answer discarded — bot speaking or in echo cooldown', { trigger, text: userText.substring(0, 60) });
+        currentTranscript = '';
+        return;
+      }
+      logger.info('Candidate finished answering — processing', { trigger, text: userText });
+      currentTranscript = '';
+      processUserTurn(userText);
+    };
+
+    // --- Accumulate transcript and detect end of user turn ---
+    stt.on(LiveTranscriptionEvents.Transcript, data => {
+      const transcript = data.channel?.alternatives?.[0]?.transcript;
+      if (!transcript) return;
+      lastCandidateSpeechAt = Date.now();
+
+      // Any new words (interim or final) during the grace period: still answering
+      if (answerGraceTimer) {
+        clearTimeout(answerGraceTimer);
+        answerGraceTimer = null;
+        logger.info('Candidate resumed speaking — extending answer', { text: transcript.substring(0, 60) });
+      }
+
+      if (data.is_final) {
+        // Proctoring: check for secondary speakers in diarized word list
+        const now = Date.now();
+        const secondaryRuns = findSecondarySpeech(data.channel?.alternatives?.[0]?.words || [], speakerWordCounts);
+        if (secondaryRuns.length && now - lastSecondaryLogTime > 5000) { // throttle: at most 1 event per 5 s
+          const { speaker, words } = secondaryRuns[0]; // one event per segment is sufficient
+          const sampleText = words.map(w => w.punctuated_word || w.word).join(' ');
+          lastSecondaryLogTime = now;
+          secondarySpeakerEvents.push({
+            timestamp_ms: now - sessionStartTime,
+            speaker_id: speaker,
+            sample_word: words[0].word || '',
+            sample_text: sampleText,
+            word_count: words.length
+          });
+          logger.warn('Proctoring: secondary speaker detected', { speaker, wordCount: words.length, text: sampleText });
+        }
+
+        currentTranscript += (currentTranscript ? ' ' : '') + transcript;
+        logger.info('STT transcript (final)', {
+          text: transcript,
+          accumulated: currentTranscript,
+          speechFinal: data.speech_final
+        });
+
+        // If we're waiting for the candidate to answer the last question,
+        // any STT activity means they're actively speaking — reset the backup timer.
+        // This prevents premature close when their answer got caught in the echo cooldown.
+        if ((awaitingLastAnswer || interviewEnded) && !closingSent && backupCloseTimer) {
+          logger.info('STT activity after last question — resetting backup close timer');
+          scheduleBackupClose();
+        }
+
+        // speech_final means the user paused — give them answerGraceMs to continue
+        if (data.speech_final && currentTranscript.trim()) {
+          answerGraceTimer = setTimeout(() => commitAnswer('speech_final + grace'), answerGraceMs);
+        }
+      }
+    });
+
+    // UtteranceEnd is a fallback — fires after utterance_end_ms of silence.
+    // Apply the same gate as sendAudio() — Deepgram can buffer audio before isBotSpeaking
+    // was raised and emit UtteranceEnd after the bot starts talking, which would send
+    // echoed bot audio to the LLM. Discard the accumulated transcript in that case.
+    // utterance_end_ms is set longer than endpointing + grace, so this only fires
+    // first when Deepgram never emitted speech_final for the utterance.
+    stt.on(LiveTranscriptionEvents.UtteranceEnd, () => {
+      commitAnswer('utterance_end');
+    });
+
+    // Keep STT and TTS connections alive.
+    // Deepgram closes idle connections after ~30s — this fires every 8s to prevent that.
+    // TTS idles whenever the candidate is speaking (which can be 20-30s per answer),
+    // so without this keepalive the TTS connection drops and closing never plays.
+    const keepAlive = setInterval(() => {
+      if (sttReady && stt.keepAlive) {
+        stt.keepAlive();
+      }
+      if (ttsReady && tts.keepAlive) {
+        tts.keepAlive();
+      }
+    }, 8000);
+
+    // Screening wrap-up: a minute before the end, stop asking new questions. The answer
+    // in progress (or the next one) is followed by the closing; durationTimer still ends
+    // the call on time if the candidate stays silent.
+    let wrapUpRequested = false;
+    const wrapUpBeforeEndMs = config.wrapUpBeforeEndMs ?? WRAP_UP_BEFORE_END_MS;
+    const wrapUpTimer = questionCount === 0 && interviewDurationMs > 2 * wrapUpBeforeEndMs
+      ? setTimeout(() => {
+        wrapUpRequested = true;
+        logger.info('Interview is in its last minute — wrapping up after the current answer');
+      }, interviewDurationMs - wrapUpBeforeEndMs)
+      : null;
+
+    // Proactive interview end timer — fires even if candidate is silent after the last question.
+    // This ensures the closing message is always delivered regardless of candidate activity.
+    let overtimeCloseTimer = null; // Caps how long a mid-answer candidate can run past the duration
+    const durationTimer = setTimeout(() => {
+      if (interviewEnded || closingSent) return;
+      interviewEnded = true;
+      logger.info('Interview duration timer fired — wrapping up', {
+        durationMinutes: Math.floor(interviewDurationMs / 60000)
+      });
+
+      if (isBotSpeaking) {
+        pendingClose = true;
+        logger.info('Bot is mid-speech at timer fire, deferring closing to TTS Flushed');
+      } else if (currentTranscript.trim() || answerGraceTimer || Date.now() - lastCandidateSpeechAt < 3000) {
+        // Candidate is mid-answer. Closing now would talk over them and lose the answer.
+        // commitAnswer -> processUserTurn (interviewEnded) records it and sends the closing.
+        logger.info('Candidate mid-answer at timer fire, closing after they finish');
+        overtimeCloseTimer = setTimeout(() => {
+          overtimeCloseTimer = null;
+          if (closingSent) return;
+          logger.info('Candidate still talking 20s past interview duration — closing now');
+          if (isBotSpeaking) pendingClose = true; else sendClosingMessage();
+        }, 20000);
+      } else {
+        sendClosingMessage();
+      }
+    }, interviewDurationMs);
+
+    // --- Session object ---
+    const session = {
+      stt,
+      tts,
+      keepAlive,
+      /** Get the accumulated interview transcript entries */
+      getTranscript() { return interviewTranscript; },
+
+      /** Epoch ms this session started — transcript timestamps are relative to it */
+      getStartTime() { return sessionStartTime; },
+
+      /** Get proctoring data collected during this session */
+      getProctoringData() {
+        return { secondarySpeakerEvents, participantEvents };
+      },
+
+      /** Record a participant status event (camera/screen share) sent by Attendee bot pod */
+      addParticipantEvent(event) {
+        if (event.event === 'camera_on' || event.event === 'camera_off') {
+          // Re-sent every 10s as a heartbeat — track state, record only changes
+          const prev = cameraOn;
+          updateCamera(event.participant_uuid, event.event === 'camera_on');
+          if (cameraOn === prev) return;
+        }
+        // Attendee's own timestamp_ms is epoch time; keep it, but store session-relative
+        // time like every other proctoring event
+        participantEvents.push({
+          ...event,
+          attendee_timestamp_ms: event.timestamp_ms,
+          timestamp_ms: Date.now() - sessionStartTime
+        });
+        logger.info('Proctoring: participant event recorded', event);
+      },
+      sttReady: () => sttReady,
+      ttsReady: () => ttsReady,
+
+      /** Send audio from meeting to STT (gated: skip while bot is speaking or in echo cooldown) */
+      sendAudio(audioBuffer) {
+        // Don't send audio to STT while bot is speaking — the mixed audio
+        // contains the bot's own TTS output, which would create a feedback loop
+        // (STT transcribes bot → processUserTurn → LLM → TTS → repeat).
+        if (!sttReady) {
+          if (!hasGreeted && preSttBufferBytes + audioBuffer.length <= MAX_PRE_STT_BUFFER_BYTES) {
+            preSttBuffer.push(audioBuffer);
+            preSttBufferBytes += audioBuffer.length;
+          }
+          return;
+        }
+        if (isBotSpeaking || Date.now() < sttPausedUntil) {
+          return;
+        }
+        stt.send(audioBuffer);
+      },
+
+      /** Clean up all resources */
+      close() {
+        clearInterval(keepAlive);
+        clearTimeout(durationTimer);
+        if (wrapUpTimer) clearTimeout(wrapUpTimer);
+        cameraWaiters.forEach(w => w.resolve());
+        cameraWaiters = [];
+        if (backupCloseTimer) { clearTimeout(backupCloseTimer); backupCloseTimer = null; }
+        if (screeningGreetTimer) { clearTimeout(screeningGreetTimer); screeningGreetTimer = null; }
+        if (answerGraceTimer) { clearTimeout(answerGraceTimer); answerGraceTimer = null; }
+        if (overtimeCloseTimer) { clearTimeout(overtimeCloseTimer); overtimeCloseTimer = null; }
+
+        if (pendingLLMAbort) {
+          pendingLLMAbort.abort();
+          pendingLLMAbort = null;
+        }
+
+        try { if (sttReady) stt.requestClose(); } catch (e) { /* ignore */ }
+        try { if (ttsReady) tts.requestClose(); } catch (e) { /* ignore */ }
+
+        logger.info('Voice session closed');
+      }
+    };
+
     return session;
   }
+  // ---- END verbatim (createSession) ----
 
   /**
-   * Get active session count
+   * Session config for an interview row. The Zoom bot builds the same config in two
+   * steps — api.service joinMeeting (row -> WebSocket URL params) and the voiceAgent
+   * WebSocket handler (params -> config); this is both in one. Keep them in step.
+   * The caller adds onInterviewComplete.
    */
-  getActiveSessionCount() {
-    return this.activeSessions.size;
-  }
-
-  /**
-   * Close all active sessions
-   */
-  closeAllSessions() {
-    for (const [sessionId, session] of this.activeSessions) {
-      try {
-        session.close();
-      } catch (err) {
-        logger.error('Error closing session', { sessionId, error: err.message });
-      }
+  buildSessionConfig(interview) {
+    let botConfig = interview.bot_config || {};
+    if (typeof botConfig === 'string') {
+      try { botConfig = JSON.parse(botConfig); } catch (e) { botConfig = {}; }
     }
+    const interviewStage = interview.interview_stage === 'fitment' ? 'fitment' : 'screening';
+    // bot_config.duration_minutes (set per invite) wins over the row's duration_minutes
+    const durationMinutes = parseInt(botConfig.duration_minutes || interview.duration_minutes, 10) || null;
+    const skills = Array.isArray(interview.skills) ? interview.skills.join(',') : (interview.skills || '');
+
+    const configuredLanguage = getNormalizedLangCode(botConfig.language);
+    const languageFallbacks = getLanguageConfig(configuredLanguage);
+    let candidateName = languageFallbacks.fallbackCandidateName || '';
+    let orgName = languageFallbacks.fallbackOrgName || 'our organization';
+    let jdTitle = languageFallbacks.fallbackJdTitle || 'the position';
+    let prompt, greeting, closing, sessionSkills = skills, effectiveDurationMinutes = durationMinutes;
+
+    if (interviewStage === 'fitment') {
+      orgName = botConfig.org_name || orgName;
+      jdTitle = botConfig.jd_title || jdTitle;
+      const durationMins = durationMinutes || 10;
+      effectiveDurationMinutes = durationMins;
+      const candidate = botConfig.candidate || {};
+      candidateName = [candidate.first_name, candidate.last_name].filter(Boolean).join(' ')
+        || languageFallbacks.fallbackCandidateName || '';
+      const questions = botConfig.questions && botConfig.questions.length > 0
+        ? botConfig.questions.map((q, i) => `${i + 1}. ${q.question}`).join('\n')
+        : DEFAULT_FITMENT_QUESTIONS;
+      prompt = (fitmentPromptConfig.system_prompt || this.defaultPrompt)
+        .replace(/\{org_name\}/g, orgName)
+        .replace(/\{jd_title\}/g, jdTitle)
+        .replace(/\{questions\}/g, questions);
+      greeting = (fitmentPromptConfig.greeting || this.defaultGreeting)
+        .replace(/\{candidate_name\}/g, candidateName)
+        .replace(/\{org_name\}/g, orgName)
+        .replace(/\{jd_title\}/g, jdTitle)
+        .replace(/\{duration_minutes\}/g, String(durationMins));
+      closing = fitmentPromptConfig.closing || this.defaultClosing;
+    } else {
+      // Invite topic (screening_topic > topic > jd_title) replaces the skill list
+      const topic = String(botConfig.screening_topic || botConfig.topic || botConfig.jd_title || '').trim();
+      if (topic) sessionSkills = topic;
+      const skillsLabel = topic
+        || skills.split(',').map(s => s.trim()).filter(Boolean).join(', ')
+        || 'general software engineering';
+      prompt = this.defaultPrompt.replace(/\{skills\}/g, skillsLabel);
+      candidateName = toDisplayName(botConfig.candidate?.first_name);
+      const templateValues = {
+        skills: skillsLabel,
+        candidate_name: candidateName,
+        duration_minutes: String(effectiveDurationMinutes || Math.round(this.interviewDurationMs / 60000))
+      };
+      greeting = fillTemplate(this.defaultGreeting, templateValues);
+      closing = fillTemplate(this.defaultClosing, templateValues);
+    }
+
+    // Same answer-timing tuning as the Zoom bot (see voiceAgent: endpointing + grace)
+    return {
+      prompt,
+      greeting,
+      closing,
+      skills: sessionSkills,
+      durationMinutes: effectiveDurationMinutes,
+      questionCount: interviewStage === 'fitment'
+        ? (botConfig.questions?.length > 0 ? botConfig.questions.length : 5)
+        : 0,
+      candidateName,
+      orgName,
+      jdTitle,
+      language: configuredLanguage,
+      // A phone call has no "candidate speaks first" — the bot opens as soon as they answer
+      autoGreet: true,
+      sttEndpointing: interviewStage === 'fitment' ? 700 : 800,
+      sttUtteranceEndMs: interviewStage === 'fitment' ? 3000 : 5000,
+      answerGraceMs: interviewStage === 'fitment' ? 1800 : 2500,
+      cameraLines: null // no camera on a phone call
+    };
   }
 }
 
-// Singleton instance
-const interviewBrainService = new InterviewBrainService();
-
-module.exports = interviewBrainService;
+module.exports = new InterviewBrainService();

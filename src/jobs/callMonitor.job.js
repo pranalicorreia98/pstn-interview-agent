@@ -14,6 +14,7 @@ const logger = require('../utils/logger');
 const databaseService = require('../services/database.service');
 const telephonyService = require('../services/telephony.service');
 const phoneAgentService = require('../services/phoneAgent.service');
+const transcriptService = require('../services/transcript.service');
 
 // Call states that indicate the call has ended
 const TERMINAL_STATES = ['completed', 'no_answer', 'busy', 'failed', 'voicemail'];
@@ -75,6 +76,11 @@ class CallMonitorJob {
   async runCycle() {
     this.lastRunTime = new Date().toISOString();
 
+    // Before the no-active-calls return: missing transcripts matter most when nothing
+    // is live (e.g. right after a restart)
+    await transcriptService.recoverMissingTranscripts()
+      .catch(err => logger.error('Transcript recovery sweep failed', { error: err.message }));
+
     try {
       // Get all interviews with active calls from database
       const activeInterviews = await databaseService.getActiveCallInterviews();
@@ -105,11 +111,10 @@ class CallMonitorJob {
    * Check status of a single call
    */
   async checkCall(interview) {
-    const { id: interviewId, call_status: currentStatus, call_metadata, livekit_room_name: roomName } = interview;
-    const sipParticipantId = call_metadata?.sip_participant_id;
+    const { id: interviewId, call_status: currentStatus, livekit_room_name: roomName } = interview;
 
-    if (!sipParticipantId) {
-      logger.warn('Interview missing SIP participant ID', { interviewId });
+    if (!roomName) {
+      logger.warn('Interview missing LiveKit room name', { interviewId });
       return;
     }
 
@@ -119,7 +124,7 @@ class CallMonitorJob {
     // Get status from LiveKit
     let livekitStatus = null;
     try {
-      livekitStatus = await telephonyService.getCallStatus(roomName, sipParticipantId);
+      livekitStatus = await telephonyService.getCallStatus(roomName, telephonyService.candidateIdentity(interviewId));
     } catch (err) {
       // If we can't get status, the call may have ended
       logger.warn('Could not get LiveKit call status', {
@@ -172,13 +177,15 @@ class CallMonitorJob {
         logger.info('Call answered (detected from LiveKit)', { interviewId });
         await databaseService.markCallConnected(interviewId, livekitStatus.amdResult);
       } else if (TERMINAL_STATES.includes(livekitStatus.status)) {
-        // Call ended during dialing
+        // Call ended before it was answered (not picked up, rejected, ring timeout)
         logger.info('Call ended during dialing', {
           interviewId,
           status: livekitStatus.status,
           reason: livekitStatus.disconnectReason,
         });
-        await databaseService.markCallFailed(interviewId, livekitStatus.status);
+        await databaseService.markCallFailed(interviewId, 'no_answer');
+        // The bot is still waiting in the room for audio that will never come
+        await phoneAgentService.endCall(interview.livekit_room_name, 'no_answer');
       }
     }
   }
@@ -206,7 +213,8 @@ class CallMonitorJob {
       logger.info('Call answered (detected from ringing)', { interviewId });
       await databaseService.markCallConnected(interviewId, livekitStatus.amdResult);
     } else if (livekitStatus && TERMINAL_STATES.includes(livekitStatus.status)) {
-      await databaseService.markCallFailed(interviewId, livekitStatus.status);
+      await databaseService.markCallFailed(interviewId, 'no_answer');
+      await phoneAgentService.endCall(interview.livekit_room_name, 'no_answer');
     }
   }
 

@@ -11,6 +11,8 @@ const logger = require('./utils/logger');
 const databaseService = require('./services/database.service');
 const telephonyService = require('./services/telephony.service');
 const phoneAgentService = require('./services/phoneAgent.service');
+const interviewBrain = require('./services/interviewBrain.service');
+const transcriptService = require('./services/transcript.service');
 const cronJob = require('./jobs/cron.job');
 const callMonitorJob = require('./jobs/callMonitor.job');
 
@@ -46,8 +48,10 @@ app.get('/api/calls', (req, res) => {
 });
 
 // Manually trigger a call (for testing)
+// Body: { phoneNumber, topic?, candidateName?, durationMinutes?, stage? } — builds the
+// same session config a real screening gets (interviewBrain.buildSessionConfig).
 app.post('/api/calls/test', async (req, res) => {
-  const { phoneNumber, interviewConfig } = req.body;
+  const { phoneNumber, topic, candidateName, durationMinutes, stage } = req.body;
 
   if (!phoneNumber) {
     return res.status(400).json({ error: 'phoneNumber is required' });
@@ -64,7 +68,7 @@ app.post('/api/calls/test', async (req, res) => {
     });
 
     // Generate token
-    const token = telephonyService.generateAccessToken(
+    const token = await telephonyService.generateAccessToken(
       callInfo.roomName,
       `bot-${testInterviewId}`
     );
@@ -74,11 +78,12 @@ app.post('/api/calls/test', async (req, res) => {
       roomName: callInfo.roomName,
       token,
       livekitUrl: process.env.LIVEKIT_URL,
-      interviewConfig: interviewConfig || {
-        language: 'en',
-        durationMinutes: 5,
-        greeting: 'Hello! This is a test call from the interview agent.',
-      },
+      interviewId: testInterviewId,
+      interviewConfig: interviewBrain.buildSessionConfig({
+        interview_stage: stage || 'screening',
+        duration_minutes: durationMinutes || 5,
+        bot_config: { jd_title: topic, candidate: { first_name: candidateName } },
+      }),
       onCallComplete: (result) => {
         logger.info('Test call completed', { result });
       },
@@ -227,6 +232,9 @@ function setupGracefulShutdown() {
     // End all active calls gracefully
     logger.info('Ending all active calls...');
     await phoneAgentService.endAllCalls('shutdown');
+
+    // Let the final transcript backups land (capped so shutdown can't hang)
+    await Promise.race([transcriptService.flush(), new Promise(r => setTimeout(r, 10000))]);
 
     logger.info('Shutdown completed');
     process.exit(0);

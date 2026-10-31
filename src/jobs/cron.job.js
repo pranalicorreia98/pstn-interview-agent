@@ -9,6 +9,8 @@ const logger = require('../utils/logger');
 const databaseService = require('../services/database.service');
 const telephonyService = require('../services/telephony.service');
 const phoneAgentService = require('../services/phoneAgent.service');
+const interviewBrain = require('../services/interviewBrain.service');
+const transcriptService = require('../services/transcript.service');
 
 class CronJob {
   constructor() {
@@ -140,6 +142,13 @@ class CronJob {
       candidatePhone: `${interview.candidate_phone_number?.slice(0, 6)}****`,
     });
 
+    // Claim it first (scheduled -> in_progress) so the next cycle — or a second
+    // instance — can't dial the same candidate again
+    if (!(await databaseService.claimInterview(interview.id))) {
+      logger.info('Interview already claimed, skipping', { interviewId: interview.id });
+      return;
+    }
+
     // Place the outbound call via LiveKit SIP
     const callInfo = await telephonyService.placeCall({
       interviewId: interview.id,
@@ -155,32 +164,21 @@ class CronJob {
     );
 
     // Generate access token for the bot to join the room
-    const token = telephonyService.generateAccessToken(
+    const token = await telephonyService.generateAccessToken(
       callInfo.roomName,
       `bot-${interview.id}`
     );
 
-    // Build interview config from database record
-    const interviewConfig = {
-      language: interview.language || 'en',
-      candidateName: interview.candidate_name,
-      orgName: interview.org_name,
-      jdTitle: interview.jd_title,
-      skills: interview.skills,
-      prompt: interview.system_prompt || interview.bot_config?.system_prompt,
-      greeting: interview.greeting || interview.bot_config?.greeting,
-      closing: interview.closing || interview.bot_config?.closing,
-      durationMinutes: interview.duration_minutes || 30,
-      questionCount: interview.question_count || 0, // 0 = screening
-      sttUtteranceEndMs: interview.interview_stage === 'fitment' ? 2000 : 5000,
-      sttEndpointing: interview.interview_stage === 'fitment' ? 400 : 800,
-    };
+    // Same config the Zoom bot builds: topic/skills, candidate name, duration from
+    // bot_config, per-stage answer timing
+    const interviewConfig = interviewBrain.buildSessionConfig(interview);
 
     // Join the room and start the phone agent
     await phoneAgentService.joinCall({
       roomName: callInfo.roomName,
       token,
       livekitUrl: process.env.LIVEKIT_URL,
+      interviewId: interview.id,
       interviewConfig,
       onCallComplete: async (result) => {
         await this.handleCallComplete(interview.id, result);
@@ -207,23 +205,16 @@ class CronJob {
     });
 
     try {
-      if (reason === 'completed' || reason === 'max_duration') {
-        await databaseService.markCallCompleted(interviewId, {
-          transcript,
-          proctoringData,
-          duration,
-          reason,
-        });
-      } else if (reason === 'candidate_hangup') {
-        await databaseService.markCallCompleted(interviewId, {
-          transcript,
-          proctoringData,
-          duration,
-          reason: 'candidate_hangup',
-        });
+      // Any call where the candidate said something counts as an interview: hanging up
+      // early or hitting a timeout still gets a transcript and a report.
+      const candidateSpoke = (transcript || []).some(e => e.speaker === 'Candidate');
+      if (candidateSpoke || reason === 'completed') {
+        await databaseService.markCallCompleted(interviewId, { duration, reason });
+        // The transcripts row triggers the report; on failure the recovery sweep retries
+        await transcriptService.saveTranscript(interviewId, transcript, proctoringData);
       } else {
-        // no_answer, busy, voicemail, failed, etc.
-        await databaseService.markCallFailed(interviewId, reason);
+        // no answer, busy, voicemail, dial failure, or the candidate never spoke
+        await databaseService.markCallFailed(interviewId, reason === 'candidate_hangup' ? 'no_answer' : reason);
       }
     } catch (err) {
       logger.error('Error handling call completion', {

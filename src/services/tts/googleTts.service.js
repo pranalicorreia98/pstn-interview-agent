@@ -108,6 +108,8 @@ class GoogleTTSStream extends EventEmitter {
     this.isConnected = false;
     this.pendingText = '';
     this.isSynthesizing = false;
+    this.flushedTimer = null; // Fires 'flushed' once queued audio has finished playing
+    this.playbackEndsAt = 0;  // Epoch ms when all audio sent so far finishes playing in the meeting
 
     // Audio chunking settings (match Deepgram's ~100ms chunks)
     this.chunkSize = Math.floor(sampleRate * 0.1) * 2; // 100ms of 16-bit audio
@@ -233,6 +235,8 @@ class GoogleTTSStream extends EventEmitter {
 
       // Emit audio in chunks to match Deepgram's streaming behavior
       // This provides smoother playback and allows for interruption
+      const playbackMs = Math.round((audioBuffer.length / 2) / this.sampleRate * 1000);
+      const sendStartTime = Date.now();
       for (let i = 0; i < audioBuffer.length; i += this.chunkSize) {
         const chunk = audioBuffer.slice(i, Math.min(i + this.chunkSize, audioBuffer.length));
         this.emit('audio', chunk);
@@ -245,7 +249,25 @@ class GoogleTTSStream extends EventEmitter {
       }
 
       this.isSynthesizing = false;
-      this.emit('flushed');
+
+      // Chunks go out ~10x faster than real time, but Zoom plays them at real time.
+      // Emitting 'flushed' now told the voice agent the bot had stopped talking while
+      // most of the audio was still playing — STT reopened and transcribed the bot's
+      // own question as the candidate's answer. Wait until playback actually ends.
+      // Audio queued behind still-playing audio (greeting then Q1) plays after it,
+      // so track one cumulative end time and re-arm a single timer.
+      this.playbackEndsAt = Math.max(this.playbackEndsAt, sendStartTime) + playbackMs;
+      const remainingPlaybackMs = this.playbackEndsAt - Date.now();
+      if (this.flushedTimer) clearTimeout(this.flushedTimer);
+      this.flushedTimer = null;
+      if (remainingPlaybackMs > 0) {
+        this.flushedTimer = setTimeout(() => {
+          this.flushedTimer = null;
+          this.emit('flushed');
+        }, remainingPlaybackMs);
+      } else {
+        this.emit('flushed');
+      }
 
     } catch (error) {
       this.isSynthesizing = false;
@@ -331,6 +353,10 @@ class GoogleTTSStream extends EventEmitter {
     logger.info('Closing Google TTS stream');
     this.isConnected = false;
     this.pendingText = '';
+    if (this.flushedTimer) {
+      clearTimeout(this.flushedTimer);
+      this.flushedTimer = null;
+    }
 
     // Only close SDK client if using service account auth
     if (this.client && !this.useRestApi) {
