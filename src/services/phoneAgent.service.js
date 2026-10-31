@@ -14,7 +14,7 @@
 
 const {
   Room, RoomEvent, TrackKind, TrackSource, TrackPublishOptions,
-  AudioSource, AudioStream, AudioFrame, LocalAudioTrack,
+  AudioSource, AudioStream, AudioFrame, LocalAudioTrack, AudioResampler,
 } = require('@livekit/rtc-node');
 const logger = require('../utils/logger');
 const interviewBrain = require('./interviewBrain.service');
@@ -24,8 +24,11 @@ const transcriptService = require('./transcript.service');
 // Maximum concurrent phone calls (cost control)
 const MAX_CONCURRENT_CALLS = parseInt(process.env.MAX_CONCURRENT_CALLS) || 3;
 
-const SAMPLE_RATE = 16000;
-const FRAME_SAMPLES = SAMPLE_RATE / 50;          // 20 ms frames into the AudioSource
+const INPUT_RATE = 16000;   // the brain's STT/TTS sample rate
+const OUTPUT_RATE = 48000;  // LiveKit's native rate — publishing at this and resampling
+                            // the TTS up to it avoids the crude internal resample that
+                            // reached the phone as muffled audio
+const OUT_FRAME_SAMPLES = OUTPUT_RATE / 50; // 20 ms frames at 48 kHz
 const TRANSCRIPT_BACKUP_INTERVAL_MS = 60000;
 
 class PhoneAgentService {
@@ -80,10 +83,13 @@ class PhoneAgentService {
     const call = {
       room,
       interviewId,
-      session: null,          // set when the candidate's audio arrives
+      session: null,          // set once the call is answered
       audioSource: null,
       audioStream: null,
+      resampler: null,        // 16 kHz TTS -> 48 kHz for LiveKit
+      candidateTrack: null,   // the SIP audio track, held until the call is answered
       sipParticipant: null,
+      ended: false,
       playout: Promise.resolve(), // serialises frames into the AudioSource
       timers: [],
       inactivityTimer: null,
@@ -103,15 +109,14 @@ class PhoneAgentService {
       }, this.inactivityTimeoutMs);
     };
 
-    // Candidate's audio -> interview brain
-    room.on(RoomEvent.TrackSubscribed, (track, publication, participant) => {
-      if (track.kind !== TrackKind.KIND_AUDIO) return;
-      if (!participant.identity.startsWith('sip_')) return;
-      if (call.session) return; // already running (e.g. track re-subscribed)
-
-      call.sipParticipant = participant;
+    // Greet only once the SIP call is actually answered. LiveKit makes the candidate's
+    // audio track subscribable while the phone is still RINGING, so starting on
+    // TrackSubscribed talked over dead air and the candidate missed the opening. The
+    // answer signal is the participant attribute sip.callStatus === 'active'.
+    const startInterview = (reason) => {
+      if (call.session || call.ended || !call.candidateTrack) return;
       call.metadata.status = 'in_progress';
-      logger.info('Subscribed to SIP participant audio', { roomName, participantId: participant.identity });
+      logger.info('Call answered — starting interview', { roomName, reason });
 
       call.session = interviewBrain.createSession(
         {
@@ -128,8 +133,8 @@ class PhoneAgentService {
         transcriptService.backup(interviewId, call.session?.getTranscript());
       }, TRANSCRIPT_BACKUP_INTERVAL_MS));
 
-      // AudioStream resamples the call audio to what STT expects (16 kHz mono PCM16)
-      call.audioStream = new AudioStream(track, SAMPLE_RATE, 1);
+      // AudioStream resamples the incoming call audio to 16 kHz mono PCM16 for STT
+      call.audioStream = new AudioStream(call.candidateTrack, INPUT_RATE, 1);
       (async () => {
         for await (const frame of call.audioStream) {
           if (!call.session) break;
@@ -138,6 +143,33 @@ class PhoneAgentService {
         }
       })().catch(err => logger.error('Error reading candidate audio', { roomName, error: err.message }));
       resetInactivityTimer();
+    };
+
+    room.on(RoomEvent.TrackSubscribed, (track, publication, participant) => {
+      if (track.kind !== TrackKind.KIND_AUDIO) return;
+      if (!participant.identity.startsWith('sip_')) return;
+      call.sipParticipant = participant;
+      call.candidateTrack = track;
+      const status = participant.attributes?.['sip.callStatus'];
+      logger.info('SIP audio track subscribed', { roomName, sipCallStatus: status || '(none)' });
+
+      if (status === 'active') {
+        startInterview('active-on-subscribe');
+      } else {
+        // Insurance: if the answer attribute never arrives but the call is up, start
+        // anyway rather than sit silent. A real answer fires 'active' well before this.
+        const t = setTimeout(() => startInterview('answer-fallback'), 20000);
+        call.timers.push(t);
+      }
+    });
+
+    room.on(RoomEvent.ParticipantAttributesChanged, (changed, participant) => {
+      if (!participant.identity.startsWith('sip_')) return;
+      call.sipParticipant = participant;
+      const status = participant.attributes?.['sip.callStatus'];
+      logger.info('SIP call status changed', { roomName, sipCallStatus: status });
+      if (status === 'active') startInterview('active');
+      else if (status === 'hangup') this.endCall(roomName, 'candidate_hangup');
     });
 
     room.on(RoomEvent.ParticipantDisconnected, (participant) => {
@@ -157,8 +189,9 @@ class PhoneAgentService {
       await room.connect(livekitUrl, token, { autoSubscribe: true, dynacast: true });
       logger.info('Connected to LiveKit room', { roomName });
 
-      // The bot's voice: one persistent track the brain's TTS is pushed into
-      call.audioSource = new AudioSource(SAMPLE_RATE, 1);
+      // The bot's voice: one persistent 48 kHz track the brain's TTS is resampled into
+      call.audioSource = new AudioSource(OUTPUT_RATE, 1);
+      call.resampler = new AudioResampler(INPUT_RATE, OUTPUT_RATE, 1);
       const track = LocalAudioTrack.createAudioTrack('interviewer', call.audioSource);
       const options = new TrackPublishOptions();
       options.source = TrackSource.SOURCE_MICROPHONE;
@@ -187,21 +220,27 @@ class PhoneAgentService {
   }
 
   /**
-   * Queue the brain's TTS audio (16-bit PCM, 16 kHz mono) into the room's AudioSource
-   * in 20 ms frames. captureFrame paces playout in real time, so frames are chained.
+   * Resample the brain's 16 kHz TTS up to 48 kHz and queue it into the room's
+   * AudioSource in 20 ms frames. captureFrame paces playout in real time, so frames are
+   * chained. Chunks are copied (slice), since the resampler reuses its output buffer.
    */
   publishAudio(call, audioBuffer) {
-    if (!call.audioSource) return;
-    // Copy into an aligned buffer; drop a trailing odd byte rather than misalign samples
+    if (!call.audioSource || !call.resampler) return;
+    // Drop a trailing odd byte rather than misalign 16-bit samples
     const usable = audioBuffer.length - (audioBuffer.length % 2);
-    const samples = new Int16Array(usable / 2);
-    Buffer.from(samples.buffer).set(audioBuffer.subarray(0, usable));
+    if (usable <= 0) return;
+    const in16 = new Int16Array(usable / 2);
+    Buffer.from(in16.buffer).set(audioBuffer.subarray(0, usable));
 
-    for (let offset = 0; offset < samples.length; offset += FRAME_SAMPLES) {
-      const chunk = samples.subarray(offset, Math.min(offset + FRAME_SAMPLES, samples.length));
-      call.playout = call.playout
-        .then(() => call.audioSource && call.audioSource.captureFrame(new AudioFrame(chunk, SAMPLE_RATE, 1, chunk.length)))
-        .catch(err => logger.error('Error publishing audio', { error: err.message }));
+    const outFrames = call.resampler.push(new AudioFrame(in16, INPUT_RATE, 1, in16.length));
+    for (const frame of outFrames) {
+      const s = frame.data;
+      for (let offset = 0; offset < s.length; offset += OUT_FRAME_SAMPLES) {
+        const chunk = s.slice(offset, Math.min(offset + OUT_FRAME_SAMPLES, s.length));
+        call.playout = call.playout
+          .then(() => call.audioSource && call.audioSource.captureFrame(new AudioFrame(chunk, OUTPUT_RATE, 1, chunk.length)))
+          .catch(err => logger.error('Error publishing audio', { error: err.message }));
+      }
     }
   }
 
@@ -213,6 +252,7 @@ class PhoneAgentService {
     if (!call) return;
     // Remove first so the room's own Disconnected event doesn't end it twice
     this.activeCalls.delete(roomName);
+    call.ended = true; // stops a pending answer-fallback from starting a session on a dead call
 
     logger.info('Ending call', { roomName, reason });
 
@@ -237,6 +277,7 @@ class PhoneAgentService {
     }
     try { call.audioStream?.close(); } catch (e) { /* ignore */ }
     call.audioSource = null;
+    call.resampler = null;
 
     // Hang up the phone line if the candidate is still on it
     if (reason !== 'candidate_hangup' && call.interviewId) {
