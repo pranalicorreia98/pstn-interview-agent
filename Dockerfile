@@ -4,6 +4,13 @@
 # resolves regardless of which OS generated any lockfile.
 FROM node:22-slim
 
+# ca-certificates: the slim image omits the CA bundle, and @livekit/rtc-node's native
+# (Rust/WebRTC) engine validates LiveKit cloud's TLS against the system store — without
+# it the room connection fails with "invalid peer certificate: UnknownIssuer".
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends ca-certificates \
+  && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /app
 
 COPY package.json ./
