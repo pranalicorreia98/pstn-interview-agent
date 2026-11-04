@@ -108,143 +108,31 @@ class CallMonitorJob {
   }
 
   /**
-   * Check status of a single call
+   * Orphan cleanup for one in-progress PSTN interview.
+   *
+   * The live lifecycle (answer, hang-up, no-answer, ring/max-duration timeouts) is driven
+   * by the phone agent's own LiveKit events — so a call this process is actively running is
+   * left alone. This sweep only catches rows left 'in_progress' with no live call (e.g. the
+   * agent restarted mid-call): once such a row is clearly past when it should have finished,
+   * it's marked failed so it doesn't sit stuck forever.
    */
   async checkCall(interview) {
-    const { id: interviewId, call_status: currentStatus, livekit_room_name: roomName } = interview;
+    const interviewId = interview.id;
+    let botConfig = interview.bot_config || {};
+    if (typeof botConfig === 'string') { try { botConfig = JSON.parse(botConfig); } catch (e) { botConfig = {}; } }
 
-    if (!roomName) {
-      logger.warn('Interview missing LiveKit room name', { interviewId });
-      return;
-    }
+    const roomName = telephonyService.generateRoomName(interviewId);
+    if (phoneAgentService.getCallStatus(roomName)) return; // live here — the agent owns it
 
-    // Check if phone agent has this call active
-    const localStatus = phoneAgentService.getCallStatus(roomName);
-
-    // Get status from LiveKit
-    let livekitStatus = null;
-    try {
-      livekitStatus = await telephonyService.getCallStatus(roomName, telephonyService.candidateIdentity(interviewId));
-    } catch (err) {
-      // If we can't get status, the call may have ended
-      logger.warn('Could not get LiveKit call status', {
-        interviewId,
-        error: err.message,
+    const startedAt = botConfig._call?.dial_started_at || interview.bot_updated_at || interview.scheduled_for;
+    const ageMs = Date.now() - new Date(startedAt).getTime();
+    const maxMs = ((parseInt(interview.duration_minutes, 10) || 10) + 5) * 60 * 1000;
+    if (ageMs > maxMs) {
+      logger.warn('Orphaned in_progress PSTN interview — marking failed', {
+        interviewId, ageMinutes: Math.round(ageMs / 60000),
       });
-    }
-
-    // Handle based on current state
-    switch (currentStatus) {
-      case 'dialing':
-        await this.handleDialingState(interview, livekitStatus, localStatus);
-        break;
-
-      case 'ringing':
-        await this.handleRingingState(interview, livekitStatus, localStatus);
-        break;
-
-      case 'in_progress':
-        await this.handleInProgressState(interview, livekitStatus, localStatus);
-        break;
-
-      default:
-        logger.warn('Unknown call status', { interviewId, currentStatus });
-    }
-  }
-
-  /**
-   * Handle call in 'dialing' state
-   */
-  async handleDialingState(interview, livekitStatus, localStatus) {
-    const { id: interviewId, call_metadata } = interview;
-    const dialStarted = call_metadata?.dial_started_at;
-
-    // Check for timeout
-    if (dialStarted) {
-      const dialDuration = Date.now() - new Date(dialStarted).getTime();
-      if (dialDuration > this.dialingTimeoutMs) {
-        logger.warn('Call stuck in dialing state, marking as failed', { interviewId });
-        await databaseService.markCallFailed(interviewId, 'failed', 'Dialing timeout');
-        await phoneAgentService.endCall(interview.livekit_room_name, 'dialing_timeout');
-        return;
-      }
-    }
-
-    // Check LiveKit status
-    if (livekitStatus) {
-      if (livekitStatus.status === 'in_progress') {
-        // Call was answered
-        logger.info('Call answered (detected from LiveKit)', { interviewId });
-        await databaseService.markCallConnected(interviewId, livekitStatus.amdResult);
-      } else if (TERMINAL_STATES.includes(livekitStatus.status)) {
-        // Call ended before it was answered (not picked up, rejected, ring timeout)
-        logger.info('Call ended during dialing', {
-          interviewId,
-          status: livekitStatus.status,
-          reason: livekitStatus.disconnectReason,
-        });
-        await databaseService.markCallFailed(interviewId, 'no_answer');
-        // The bot is still waiting in the room for audio that will never come
-        await phoneAgentService.endCall(interview.livekit_room_name, 'no_answer');
-      }
-    }
-  }
-
-  /**
-   * Handle call in 'ringing' state
-   */
-  async handleRingingState(interview, livekitStatus, localStatus) {
-    const { id: interviewId, call_metadata } = interview;
-    const ringingStarted = call_metadata?.ringing_started_at;
-
-    // Check for timeout
-    if (ringingStarted) {
-      const ringDuration = Date.now() - new Date(ringingStarted).getTime();
-      if (ringDuration > this.ringingTimeoutMs) {
-        logger.info('Call not answered within timeout', { interviewId });
-        await databaseService.markCallFailed(interviewId, 'no_answer');
-        await phoneAgentService.endCall(interview.livekit_room_name, 'no_answer');
-        return;
-      }
-    }
-
-    // Check if answered
-    if (livekitStatus?.status === 'in_progress') {
-      logger.info('Call answered (detected from ringing)', { interviewId });
-      await databaseService.markCallConnected(interviewId, livekitStatus.amdResult);
-    } else if (livekitStatus && TERMINAL_STATES.includes(livekitStatus.status)) {
-      await databaseService.markCallFailed(interviewId, 'no_answer');
-      await phoneAgentService.endCall(interview.livekit_room_name, 'no_answer');
-    }
-  }
-
-  /**
-   * Handle call in 'in_progress' state
-   */
-  async handleInProgressState(interview, livekitStatus, localStatus) {
-    const { id: interviewId, livekit_room_name: roomName } = interview;
-
-    // Check if call ended on LiveKit side but we don't know yet
-    if (livekitStatus && TERMINAL_STATES.includes(livekitStatus.status)) {
-      logger.info('Call ended (detected from LiveKit)', {
-        interviewId,
-        status: livekitStatus.status,
-      });
-
-      // End local session if still active
-      if (localStatus) {
-        await phoneAgentService.endCall(roomName, livekitStatus.status);
-      }
-
-      // Don't update DB here - let phoneAgent.onCallComplete handle it
-      return;
-    }
-
-    // Check if local session ended but DB not updated
-    if (!localStatus && livekitStatus?.status !== 'in_progress') {
-      logger.warn('Local session ended but call still marked in_progress', { interviewId });
-      // This shouldn't happen normally - onCallComplete should update DB
-      // Just log it for debugging
+      await databaseService.markCallFailed(interviewId, 'failed', 'Call did not complete (agent restart or lost connection)');
+      await phoneAgentService.endCall(roomName, 'orphan_cleanup').catch(() => {});
     }
   }
 }

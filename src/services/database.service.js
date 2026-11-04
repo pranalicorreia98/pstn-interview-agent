@@ -78,40 +78,41 @@ class DatabaseService {
   }
 
   /**
-   * Fetch scheduled phone interviews ready to dial
+   * Fetch scheduled PSTN interviews ready to dial.
    *
-   * Returns interviews where:
-   * - mode = 'phone'
-   * - status = 'scheduled'
-   * - scheduled_for is within the fetch window (or already past)
-   * - has a candidate_phone_number
+   * The main app (pstnCallService.createPstnCall) inserts an ordinary interviews row —
+   * mode='bot', status='scheduled', host_url=null — with the whole PSTN payload in
+   * bot_config (bot_config.type='pstn', bot_config.phone, agenda). There are NO dedicated
+   * phone columns; the agent is keyed entirely on bot_config.type='pstn'. The Zoom bot's
+   * scheduler excludes bot_config.type='pstn', so the two never grab the same row.
    */
   async fetchScheduledPhoneInterviews() {
     if (!this.supabase) {
       throw new Error('Database service not initialized');
     }
 
-    const windowEnd = new Date(Date.now() + this.fetchWindowMinutes * 60 * 1000);
+    const windowEnd = new Date(Date.now() + this.fetchWindowMinutes * 60 * 1000).toISOString();
 
     try {
       const { data, error } = await this.supabase
         .from(this.tableName)
         .select('*')
-        .eq('mode', 'phone')
+        .eq('mode', 'bot')
+        .eq('bot_config->>type', 'pstn')
         .eq('status', 'scheduled')
-        .not('candidate_phone_number', 'is', null)
-        .lte('scheduled_for', windowEnd.toISOString())
+        .eq('deleted', false)
+        .lte('scheduled_for', windowEnd)
         .order('scheduled_for', { ascending: true });
 
       if (error) {
-        logger.error('Error fetching scheduled phone interviews', { error: error.message });
+        logger.error('Error fetching scheduled PSTN interviews', { error: error.message });
         throw error;
       }
 
-      logger.info('Fetched scheduled phone interviews', { count: data?.length || 0 });
+      logger.info('Fetched scheduled PSTN interviews', { count: data?.length || 0 });
       return data || [];
     } catch (err) {
-      logger.error('Failed to fetch scheduled phone interviews', { error: err.message });
+      logger.error('Failed to fetch scheduled PSTN interviews', { error: err.message });
       throw err;
     }
   }
@@ -137,117 +138,64 @@ class DatabaseService {
   }
 
   /**
-   * Update interview call status. call_metadata is merged into the stored object —
-   * replacing it dropped sip_participant_id, which the call monitor needs.
+   * Call runtime state (room, SIP participant, timestamps, outcome) has no dedicated
+   * columns, so it's merged under bot_config._call. Additive — the report reads
+   * bot_config.agenda, never _call. Single agent instance, so read-modify-write is safe.
    */
-  async updateCallStatus(interviewId, callStatus, additionalFields = {}) {
-    if (!this.supabase) {
-      throw new Error('Database service not initialized');
-    }
-
+  async _patchCallState(interviewId, patch) {
     try {
-      const { call_metadata: metadataPatch, ...fields } = additionalFields;
-      const updateData = {
-        call_status: callStatus,
-        bot_updated_at: new Date().toISOString(),
-        ...fields,
-      };
-
-      if (metadataPatch) {
-        const { data: current } = await this.supabase
-          .from(this.tableName)
-          .select('call_metadata')
-          .eq('id', interviewId)
-          .maybeSingle();
-        updateData.call_metadata = { ...(current?.call_metadata || {}), ...metadataPatch };
-      }
-
-      const { error } = await this.supabase
-        .from(this.tableName)
-        .update(updateData)
-        .eq('id', interviewId);
-
-      if (error) {
-        logger.error('Error updating call status', { interviewId, callStatus, error: error.message });
-        throw error;
-      }
-
-      logger.info('Updated call status', { interviewId, callStatus });
+      const { data } = await this.supabase
+        .from(this.tableName).select('bot_config').eq('id', interviewId).maybeSingle();
+      let bc = data?.bot_config || {};
+      if (typeof bc === 'string') { try { bc = JSON.parse(bc); } catch (e) { bc = {}; } }
+      bc._call = { ...(bc._call || {}), ...patch };
+      const { error } = await this.supabase.from(this.tableName).update({ bot_config: bc }).eq('id', interviewId);
+      if (error) logger.warn('Failed to patch call state', { interviewId, error: error.message });
     } catch (err) {
-      logger.error('Failed to update call status', { interviewId, error: err.message });
-      throw err;
+      logger.warn('Failed to patch call state', { interviewId, error: err.message });
     }
   }
 
-  /**
-   * Store LiveKit room info for an interview
-   */
+  /** Set interviews.status (the lifecycle lives on the existing column, not a call_status one). */
+  async _setStatus(interviewId, status) {
+    const { error } = await this.supabase
+      .from(this.tableName).update({ status, bot_updated_at: new Date().toISOString() }).eq('id', interviewId);
+    if (error) logger.error('Failed to set interview status', { interviewId, status, error: error.message });
+  }
+
+  /** Store LiveKit room + SIP participant for an interview (under bot_config._call). */
   async storeRoomInfo(interviewId, roomName, sipParticipantId) {
-    return this.updateCallStatus(interviewId, 'dialing', {
-      livekit_room_name: roomName,
-      call_metadata: {
-        sip_participant_id: sipParticipantId,
-        dial_started_at: new Date().toISOString(),
-      },
+    await this._patchCallState(interviewId, {
+      room_name: roomName, sip_participant_id: sipParticipantId, dial_started_at: new Date().toISOString(),
     });
   }
 
-  /**
-   * Mark call as connected (candidate answered)
-   */
-  async markCallConnected(interviewId, amdResult = null) {
-    const callMetadata = {
-      connected_at: new Date().toISOString(),
-    };
-
-    if (amdResult) {
-      callMetadata.amd_result = amdResult;
-    }
-
-    return this.updateCallStatus(interviewId, 'in_progress', {
-      call_metadata: callMetadata,
-    });
+  /** Mark call as connected (candidate answered). */
+  async markCallConnected(interviewId) {
+    await this._patchCallState(interviewId, { connected_at: new Date().toISOString() });
   }
 
   /**
-   * Mark call as completed. The transcript itself goes to the `transcripts` table via
-   * transcript.service (that row is what triggers the report).
+   * Mark call completed: interviews.status='completed'. The transcript goes to the
+   * `transcripts` table via transcript.service (that row is what triggers the report).
    */
   async markCallCompleted(interviewId, completionData = {}) {
     const { duration, reason } = completionData;
-
-    return this.updateCallStatus(interviewId, 'completed', {
-      status: 'completed',
-      call_metadata: {
-        completed_at: new Date().toISOString(),
-        duration_ms: duration,
-        completion_reason: reason,
-      },
+    await this._patchCallState(interviewId, {
+      completed_at: new Date().toISOString(), duration_ms: duration, completion_reason: reason,
     });
+    await this._setStatus(interviewId, 'completed');
   }
 
-  /**
-   * Mark call as failed (no answer, busy, voicemail, dial error)
-   */
+  /** Mark call failed: no-answer/busy/voicemail -> 'missed', anything else -> 'error'. */
   async markCallFailed(interviewId, reason, errorMessage = null) {
-    const callMetadata = {
-      failed_at: new Date().toISOString(),
-      failure_reason: reason,
-    };
-
-    if (errorMessage) {
-      callMetadata.error_message = errorMessage;
-    }
-
-    return this.updateCallStatus(interviewId, reason, {
-      status: FAILED_CALL_STATUS[reason] || 'error',
-      call_metadata: callMetadata,
+    await this._patchCallState(interviewId, {
+      failed_at: new Date().toISOString(), failure_reason: reason, error_message: errorMessage,
     });
+    await this._setStatus(interviewId, FAILED_CALL_STATUS[reason] || 'error');
   }
 
-  /**
-   * Get interviews with active calls (for monitoring)
-   */
+  /** In-progress PSTN interviews — for the orphan-cleanup monitor. */
   async getActiveCallInterviews() {
     if (!this.supabase) {
       throw new Error('Database service not initialized');
@@ -257,8 +205,9 @@ class DatabaseService {
       const { data, error } = await this.supabase
         .from(this.tableName)
         .select('*')
-        .eq('mode', 'phone')
-        .in('call_status', ['dialing', 'ringing', 'in_progress']);
+        .eq('mode', 'bot')
+        .eq('bot_config->>type', 'pstn')
+        .eq('status', 'in_progress');
 
       if (error) {
         throw error;
@@ -266,7 +215,7 @@ class DatabaseService {
 
       return data || [];
     } catch (err) {
-      logger.error('Failed to get active call interviews', { error: err.message });
+      logger.error('Failed to get active PSTN interviews', { error: err.message });
       throw err;
     }
   }
@@ -298,29 +247,13 @@ class DatabaseService {
   }
 
   /**
-   * Get interview by room name
+   * Get interview by room name. Rooms are named `interview-<id>`
+   * (telephony.generateRoomName), so the id is derived directly — no room column needed.
    */
   async getInterviewByRoomName(roomName) {
-    if (!this.supabase) {
-      throw new Error('Database service not initialized');
-    }
-
-    try {
-      const { data, error } = await this.supabase
-        .from(this.tableName)
-        .select('*')
-        .eq('livekit_room_name', roomName)
-        .single();
-
-      if (error && error.code !== 'PGRST116') { // PGRST116 = no rows returned
-        throw error;
-      }
-
-      return data || null;
-    } catch (err) {
-      logger.error('Failed to get interview by room name', { roomName, error: err.message });
-      throw err;
-    }
+    const id = String(roomName || '').replace(/^interview-/, '');
+    if (!id) return null;
+    return this.getInterviewById(id).catch(() => null);
   }
 
   // --- Transcript hand-off (same tables and bucket as the Zoom bot) ---
@@ -401,14 +334,15 @@ class DatabaseService {
   }
 
   /**
-   * Completed phone interviews with no transcripts row (recovery sweep).
+   * Completed PSTN interviews with no transcripts row (recovery sweep).
    */
   async fetchCompletedPhoneInterviewsWithoutTranscript(sinceHours) {
     const since = new Date(Date.now() - sinceHours * 60 * 60 * 1000).toISOString();
     const { data: interviews, error } = await this.supabase
       .from(this.tableName)
       .select('id')
-      .eq('mode', 'phone')
+      .eq('mode', 'bot')
+      .eq('bot_config->>type', 'pstn')
       .eq('status', 'completed')
       .gte('bot_updated_at', since);
 
