@@ -1061,6 +1061,15 @@ class InterviewBrainService {
             scheduleBackupClose();
           }
         }
+
+        // Reminder call (not an interview): the bot delivers the opening, hears one reply,
+        // gives one acknowledgment, then wraps up — no questions. Inert unless
+        // config.reminderMode is set (PSTN action='remind' calls); the Zoom bot never sets it.
+        if (config.reminderMode && !closingSent) {
+          logger.info('Reminder acknowledged — closing after this message');
+          interviewEnded = true;
+          pendingClose = true;
+        }
       } else if (!interviewEnded) {
         // All retries failed — speak fallback so the user doesn't hear silence
         isBotSpeaking = true;
@@ -1333,6 +1342,11 @@ class InterviewBrainService {
     const fallback = agenda.fallback || null;
     const skills = Array.isArray(interview.skills) ? interview.skills.join(',') : (interview.skills || '');
 
+    // Two call types: action='conduct' runs the interview questions in-call (fitment);
+    // action='remind' is just a reminder — deliver the opening, point them to the link,
+    // and hang up WITHOUT asking any questions.
+    const action = String(botConfig.action || 'conduct').toLowerCase();
+
     const configuredLanguage = getNormalizedLangCode(botConfig.language);
     const languageFallbacks = getLanguageConfig(configuredLanguage);
     const candidate = botConfig.candidate || {};
@@ -1341,6 +1355,41 @@ class InterviewBrainService {
     const jdTitle = botConfig.jd_title || languageFallbacks.fallbackJdTitle || 'the position';
     let prompt, greeting, closing, sessionSkills = skills;
     const effectiveDurationMinutes = durationMinutes || (stage === 'fitment' ? 10 : null);
+
+    // --- Reminder call: NOT an interview. Deliver the opening, hear one reply, give one
+    // acknowledgment + point to the link, then close. No questions, no transcript/report. ---
+    if (action === 'remind') {
+      candidateName = toDisplayName(candidate.first_name);
+      const link = fallback?.link;
+      prompt =
+        `You are making a brief REMINDER phone call on behalf of ${orgName} about the candidate's ` +
+        `${botConfig.stage_label || jdTitle}. This is NOT an interview and NOT a screening — you must ` +
+        `NOT ask any questions of any kind, and you must NOT start an interview.\n\n` +
+        `You have ALREADY delivered the opening message. The candidate is now replying. Respond with ` +
+        `ONE short, warm, spoken sentence that acknowledges what they said (e.g. if they gave a time, ` +
+        `say that works and you'll note it) and ` +
+        (link
+          ? `reminds them the link to continue is already in their WhatsApp and email. `
+          : `lets them know their recruiter will follow up. `) +
+        `Then STOP — say nothing else, ask nothing, start nothing. The system closes the call.\n\n` +
+        `Plain spoken sentences only, no formatting.`;
+      greeting = opening || fillTemplate(
+        'Hi {candidate_name}, a quick reminder from {org_name} about your {jd_title}.',
+        { candidate_name: candidateName, org_name: orgName, jd_title: jdTitle });
+      closing = `Thank you${candidateName ? `, ${candidateName}` : ''}. Have a great day!`;
+      return {
+        prompt, greeting, closing, skills: '',
+        durationMinutes: effectiveDurationMinutes || 2,
+        questionCount: 0,
+        candidateName, orgName, jdTitle,
+        language: configuredLanguage,
+        autoGreet: true,
+        awaitReplyAfterGreeting: true, // speak the reminder, then wait for their reply
+        reminderMode: true,            // one ack then wrap up (see createSession)
+        sttEndpointing: 700, sttUtteranceEndMs: 3000, answerGraceMs: 1800,
+        cameraLines: null,
+      };
+    }
 
     if (stage === 'fitment') {
       candidateName = [candidate.first_name, candidate.last_name].filter(Boolean).join(' ')

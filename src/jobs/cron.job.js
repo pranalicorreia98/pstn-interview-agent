@@ -181,8 +181,9 @@ class CronJob {
     );
 
     // Same config the Zoom bot builds: topic/skills, candidate name, duration from
-    // bot_config, per-stage answer timing
+    // bot_config, per-stage answer timing. reminderMode => action='remind' (no interview).
     const interviewConfig = interviewBrain.buildSessionConfig(interview);
+    const isReminder = interviewConfig.reminderMode === true;
 
     // Join the room and start the phone agent
     await phoneAgentService.joinCall({
@@ -192,7 +193,7 @@ class CronJob {
       interviewId: interview.id,
       interviewConfig,
       onCallComplete: async (result) => {
-        await this.handleCallComplete(interview.id, result);
+        await this.handleCallComplete(interview.id, result, isReminder);
       },
     });
 
@@ -205,20 +206,33 @@ class CronJob {
   /**
    * Handle call completion
    */
-  async handleCallComplete(interviewId, result) {
+  async handleCallComplete(interviewId, result, isReminder = false) {
     const { reason, duration, transcript, proctoringData } = result;
 
     logger.info('Call completed', {
       interviewId,
       reason,
+      isReminder,
       durationMs: duration,
       transcriptEntries: transcript?.length || 0,
     });
 
     try {
-      // Any call where the candidate said something counts as an interview: hanging up
-      // early or hitting a timeout still gets a transcript and a report.
       const candidateSpoke = (transcript || []).some(e => e.speaker === 'Candidate');
+
+      // Reminder call: no transcript, no report — it isn't an interview. Just record the
+      // outcome: reached the candidate -> completed, otherwise -> missed/error.
+      if (isReminder) {
+        if (candidateSpoke || reason === 'completed' || reason === 'candidate_hangup') {
+          await databaseService.markCallCompleted(interviewId, { duration, reason });
+        } else {
+          await databaseService.markCallFailed(interviewId, reason);
+        }
+        return;
+      }
+
+      // Interview call: any call where the candidate said something counts — hanging up
+      // early or hitting a timeout still gets a transcript and a report.
       if (candidateSpoke || reason === 'completed') {
         await databaseService.markCallCompleted(interviewId, { duration, reason });
         // The transcripts row triggers the report; on failure the recovery sweep retries
