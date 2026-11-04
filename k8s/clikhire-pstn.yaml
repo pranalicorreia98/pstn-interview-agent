@@ -1,0 +1,58 @@
+# PSTN interview agent — runs in K3s next to the Zoom bot (clikhire-bot), polling the
+# same Supabase for mode='bot' + bot_config.type='pstn' scheduled interviews and dialing
+# them via LiveKit SIP + Vobiz.
+#
+# ONE replica only: the cron + claim assume a single instance (a second would race to
+# dial the same candidate). Recreate strategy guarantees the old pod stops before a new
+# one starts, so a deploy never briefly runs two.
+#
+# Env comes from the Secret `clikhire-pstn-env`, created from the local .env on the host:
+#   kubectl create secret generic clikhire-pstn-env --from-env-file=.env -n clikhire
+# Image is built locally on the host (imagePullPolicy: Never), same as the Zoom bot.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: clikhire-pstn
+  namespace: clikhire
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: clikhire-pstn
+  template:
+    metadata:
+      labels:
+        app: clikhire-pstn
+    spec:
+      containers:
+        - name: clikhire-pstn
+          image: clikhire-pstn:latest
+          imagePullPolicy: Never
+          envFrom:
+            - secretRef:
+                name: clikhire-pstn-env
+          ports:
+            - containerPort: 3000
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 3000
+            initialDelaySeconds: 10
+            periodSeconds: 15
+            timeoutSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 3000
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            timeoutSeconds: 5
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "256Mi"
+            limits:
+              cpu: "1000m"
+              memory: "1Gi"
