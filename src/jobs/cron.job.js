@@ -137,10 +137,21 @@ class CronJob {
    * Process a single interview - place call and connect to phone agent
    */
   async processInterview(interview) {
+    // The number to dial: the row's column, else bot_config.phone (new PSTN shape)
+    let botConfig = interview.bot_config || {};
+    if (typeof botConfig === 'string') { try { botConfig = JSON.parse(botConfig); } catch (e) { botConfig = {}; } }
+    const phoneNumber = interview.candidate_phone_number || botConfig.phone;
+
     logger.info('Processing phone interview', {
       interviewId: interview.id,
-      candidatePhone: `${interview.candidate_phone_number?.slice(0, 6)}****`,
+      candidatePhone: `${String(phoneNumber || '').slice(0, 6)}****`,
     });
+
+    if (!phoneNumber) {
+      logger.warn('No phone number on interview — skipping', { interviewId: interview.id });
+      await databaseService.markCallFailed(interview.id, 'failed', 'No candidate phone number');
+      return;
+    }
 
     // Claim it first (scheduled -> in_progress) so the next cycle — or a second
     // instance — can't dial the same candidate again
@@ -152,7 +163,7 @@ class CronJob {
     // Place the outbound call via LiveKit SIP
     const callInfo = await telephonyService.placeCall({
       interviewId: interview.id,
-      phoneNumber: interview.candidate_phone_number,
+      phoneNumber,
       callerIdNumber: interview.caller_id_number, // Optional
     });
 

@@ -47,24 +47,37 @@ app.get('/api/calls', (req, res) => {
   res.json({ activeCalls });
 });
 
-// Manually trigger a call (for testing)
-// Body: { phoneNumber, topic?, candidateName?, durationMinutes?, stage? } — builds the
-// same session config a real screening gets (interviewBrain.buildSessionConfig).
+// Manually trigger a call (for testing).
+// Body: either the full PSTN bot_config under `botConfig` (the shape the main app sends,
+// dialed to botConfig.phone or an override phoneNumber), OR the quick form
+// { phoneNumber, topic?, candidateName?, durationMinutes?, stage? }.
 app.post('/api/calls/test', async (req, res) => {
-  const { phoneNumber, topic, candidateName, durationMinutes, stage } = req.body;
+  const { phoneNumber, topic, candidateName, durationMinutes, stage, botConfig } = req.body;
+  const dialNumber = phoneNumber || botConfig?.phone;
 
-  if (!phoneNumber) {
-    return res.status(400).json({ error: 'phoneNumber is required' });
+  if (!dialNumber) {
+    return res.status(400).json({ error: 'phoneNumber (or botConfig.phone) is required' });
   }
 
   try {
     // Generate test interview ID
     const testInterviewId = `test-${Date.now()}`;
 
+    // Build the session config: pass the real bot_config through if given, else the quick form
+    const interviewConfig = interviewBrain.buildSessionConfig(
+      botConfig
+        ? { bot_config: botConfig }
+        : {
+          interview_stage: stage || 'screening',
+          duration_minutes: durationMinutes || 5,
+          bot_config: { jd_title: topic, candidate: { first_name: candidateName } },
+        }
+    );
+
     // Place the call
     const callInfo = await telephonyService.placeCall({
       interviewId: testInterviewId,
-      phoneNumber,
+      phoneNumber: dialNumber,
     });
 
     // Generate token
@@ -79,11 +92,7 @@ app.post('/api/calls/test', async (req, res) => {
       token,
       livekitUrl: process.env.LIVEKIT_URL,
       interviewId: testInterviewId,
-      interviewConfig: interviewBrain.buildSessionConfig({
-        interview_stage: stage || 'screening',
-        duration_minutes: durationMinutes || 5,
-        bot_config: { jd_title: topic, candidate: { first_name: candidateName } },
-      }),
+      interviewConfig,
       onCallComplete: (result) => {
         logger.info('Test call completed', { result });
       },

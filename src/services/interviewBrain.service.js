@@ -1,14 +1,18 @@
 /**
  * Interview Brain Service — the STT → LLM → TTS interview session.
  *
- * SYNCED FROM clikhireBotIntegration/src/services/voiceAgent.service.js @ 2318ae1.
+ * SYNCED FROM clikhireBotIntegration/src/services/voiceAgent.service.js @ 2318ae1,
+ * plus the `awaitReplyAfterGreeting` branch in triggerGreeting (added to BOTH files
+ * together — inert on the Zoom bot, which never sets the flag — so they stay identical).
  * The constants/helpers block and createSession() below are copied verbatim from that
  * file so fixes can be carried across by copying again — don't edit them here; change
  * the Zoom bot and re-sync. Only buildSessionConfig() (interview row -> session config)
  * and the module wiring are PSTN-specific. Transport (LiveKit SIP) is in phoneAgent.
  *
- * Zoom-only behaviour is inert on phone: the camera check runs only when
- * config.cameraLines is set, and the screening greet-fallback only when autoGreet is off.
+ * Config-flag behaviour that is inert unless a flag is set: the camera check runs only
+ * when config.cameraLines is set (Zoom screening), the screening greet-fallback only when
+ * autoGreet is off, and greet-then-wait only when config.awaitReplyAfterGreeting is set
+ * (PSTN fitment calls with a conversational opening).
  */
 
 const { createClient, LiveTranscriptionEvents } = require('@deepgram/sdk');
@@ -696,6 +700,17 @@ class InterviewBrainService {
         isBotSpeaking = true;
         let firstQuestion = '';
 
+        // A conversational opening that invites a reply ("shall we do this now, or use the
+        // link?"): speak it, then WAIT — the candidate's reply drives the first LLM turn,
+        // instead of barrelling into question one. (PSTN fitment calls set this flag;
+        // screening and the Zoom bot leave it off, so this branch is inert there.)
+        if (config.awaitReplyAfterGreeting) {
+          logger.info('Speaking opening, then waiting for the candidate to reply');
+          await speakAndWait(sessionConfig.greeting);
+          isBotSpeaking = false;
+          return;
+        }
+
         if (ttsReady) {
           logger.info('Speaking greeting via TTS', { greeting: sessionConfig.greeting, greetingLength: sessionConfig.greeting.length });
 
@@ -1303,38 +1318,46 @@ class InterviewBrainService {
     if (typeof botConfig === 'string') {
       try { botConfig = JSON.parse(botConfig); } catch (e) { botConfig = {}; }
     }
-    const interviewStage = interview.interview_stage === 'fitment' ? 'fitment' : 'screening';
-    // bot_config.duration_minutes (set per invite) wins over the row's duration_minutes
-    const durationMinutes = parseInt(botConfig.duration_minutes || interview.duration_minutes, 10) || null;
+
+    // The main app sends either the legacy flat shape or the newer PSTN "agenda" shape
+    // ({ stage, duration_target_minutes, caller_identity, agenda: { opening, questions:
+    // [{topic, question}], collect, fallback: { link, note } } }). Normalise both here.
+    const agenda = botConfig.agenda || {};
+    const stage = String(botConfig.stage || interview.interview_stage || 'screening').toLowerCase() === 'fitment'
+      ? 'fitment' : 'screening';
+    // duration_target_minutes (new) > bot_config.duration_minutes > the interview row
+    const durationMinutes = parseInt(
+      botConfig.duration_target_minutes || botConfig.duration_minutes || interview.duration_minutes, 10) || null;
+    const questionItems = (agenda.questions || botConfig.questions || []).filter(q => q && q.question);
+    const opening = (typeof agenda.opening === 'string' ? agenda.opening : '').trim();
+    const fallback = agenda.fallback || null;
     const skills = Array.isArray(interview.skills) ? interview.skills.join(',') : (interview.skills || '');
 
     const configuredLanguage = getNormalizedLangCode(botConfig.language);
     const languageFallbacks = getLanguageConfig(configuredLanguage);
+    const candidate = botConfig.candidate || {};
     let candidateName = languageFallbacks.fallbackCandidateName || '';
-    let orgName = languageFallbacks.fallbackOrgName || 'our organization';
-    let jdTitle = languageFallbacks.fallbackJdTitle || 'the position';
-    let prompt, greeting, closing, sessionSkills = skills, effectiveDurationMinutes = durationMinutes;
+    const orgName = botConfig.org_name || languageFallbacks.fallbackOrgName || 'our organization';
+    const jdTitle = botConfig.jd_title || languageFallbacks.fallbackJdTitle || 'the position';
+    let prompt, greeting, closing, sessionSkills = skills;
+    const effectiveDurationMinutes = durationMinutes || (stage === 'fitment' ? 10 : null);
 
-    if (interviewStage === 'fitment') {
-      orgName = botConfig.org_name || orgName;
-      jdTitle = botConfig.jd_title || jdTitle;
-      const durationMins = durationMinutes || 10;
-      effectiveDurationMinutes = durationMins;
-      const candidate = botConfig.candidate || {};
+    if (stage === 'fitment') {
       candidateName = [candidate.first_name, candidate.last_name].filter(Boolean).join(' ')
         || languageFallbacks.fallbackCandidateName || '';
-      const questions = botConfig.questions && botConfig.questions.length > 0
-        ? botConfig.questions.map((q, i) => `${i + 1}. ${q.question}`).join('\n')
+      const questions = questionItems.length > 0
+        ? questionItems.map((q, i) => `${i + 1}. ${q.question}`).join('\n')
         : DEFAULT_FITMENT_QUESTIONS;
       prompt = (fitmentPromptConfig.system_prompt || this.defaultPrompt)
         .replace(/\{org_name\}/g, orgName)
         .replace(/\{jd_title\}/g, jdTitle)
         .replace(/\{questions\}/g, questions);
-      greeting = (fitmentPromptConfig.greeting || this.defaultGreeting)
+      // Use the provided opening verbatim if present; else the fitment template.
+      greeting = opening || (fitmentPromptConfig.greeting || this.defaultGreeting)
         .replace(/\{candidate_name\}/g, candidateName)
         .replace(/\{org_name\}/g, orgName)
         .replace(/\{jd_title\}/g, jdTitle)
-        .replace(/\{duration_minutes\}/g, String(durationMins));
+        .replace(/\{duration_minutes\}/g, String(effectiveDurationMinutes || 10));
       closing = fitmentPromptConfig.closing || this.defaultClosing;
     } else {
       // Invite topic (screening_topic > topic > jd_title) replaces the skill list
@@ -1344,14 +1367,29 @@ class InterviewBrainService {
         || skills.split(',').map(s => s.trim()).filter(Boolean).join(', ')
         || 'general software engineering';
       prompt = this.defaultPrompt.replace(/\{skills\}/g, skillsLabel);
-      candidateName = toDisplayName(botConfig.candidate?.first_name);
+      candidateName = toDisplayName(candidate.first_name);
       const templateValues = {
         skills: skillsLabel,
         candidate_name: candidateName,
         duration_minutes: String(effectiveDurationMinutes || Math.round(this.interviewDurationMs / 60000))
       };
-      greeting = fillTemplate(this.defaultGreeting, templateValues);
+      greeting = opening || fillTemplate(this.defaultGreeting, templateValues);
       closing = fillTemplate(this.defaultClosing, templateValues);
+    }
+
+    // A conversational opening (and/or a fallback link) → tell the LLM how to handle the
+    // candidate's reply to it: begin the questions if they're ready, or point them to the
+    // link and wrap up if they'd rather not do it now.
+    if (opening || fallback?.link) {
+      const notes = [];
+      if (opening) {
+        notes.push(`This call already opened by saying:\n"${opening}"\nThe candidate is now replying to that opening — this OVERRIDES any rule about starting your first response with "To begin,". Respond to their reply first.`);
+      }
+      notes.push('When the candidate agrees or is ready, begin asking the questions above, one at a time, in order.');
+      if (fallback?.link) {
+        notes.push(`If the candidate is busy, would rather not do it now, or prefers the link, do NOT ask the questions — warmly acknowledge, tell them the link is already in their WhatsApp and email (${fallback.link}), and then say only "Perfect, thanks so much." so the system can close the call.`);
+      }
+      prompt += `\n\n\nTHIS CALL'S OPENING AND CONSENT:\n\n${notes.join('\n\n')}`;
     }
 
     // Same answer-timing tuning as the Zoom bot (see voiceAgent: endpointing + grace)
@@ -1361,18 +1399,19 @@ class InterviewBrainService {
       closing,
       skills: sessionSkills,
       durationMinutes: effectiveDurationMinutes,
-      questionCount: interviewStage === 'fitment'
-        ? (botConfig.questions?.length > 0 ? botConfig.questions.length : 5)
-        : 0,
+      questionCount: stage === 'fitment' ? (questionItems.length || 5) : 0,
       candidateName,
       orgName,
       jdTitle,
       language: configuredLanguage,
       // A phone call has no "candidate speaks first" — the bot opens as soon as they answer
       autoGreet: true,
-      sttEndpointing: interviewStage === 'fitment' ? 700 : 800,
-      sttUtteranceEndMs: interviewStage === 'fitment' ? 3000 : 5000,
-      answerGraceMs: interviewStage === 'fitment' ? 1800 : 2500,
+      // Opening that invites a reply ("now, or use the link?") → greet, then WAIT for the
+      // candidate before question one, instead of talking over the consent ask.
+      awaitReplyAfterGreeting: !!opening,
+      sttEndpointing: stage === 'fitment' ? 700 : 800,
+      sttUtteranceEndMs: stage === 'fitment' ? 3000 : 5000,
+      answerGraceMs: stage === 'fitment' ? 1800 : 2500,
       cameraLines: null // no camera on a phone call
     };
   }
