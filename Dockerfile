@@ -1,7 +1,8 @@
 # PSTN interview agent. glibc base (NOT alpine) — @livekit/rtc-node ships prebuilt
-# glibc native binaries. npm install (not ci) so the linux-x64 optional native dep
+# glibc native binaries. Node 22+ required: livekit/rtc-node needs native WebSocket,
+# which Node 20 doesn't have. npm install (not ci) so the linux-x64 optional native dep
 # resolves regardless of which OS generated any lockfile.
-FROM node:20-slim
+FROM node:22-slim
 
 WORKDIR /app
 
