@@ -1340,6 +1340,10 @@ class InterviewBrainService {
     const questionItems = (agenda.questions || botConfig.questions || []).filter(q => q && q.question);
     const opening = (typeof agenda.opening === 'string' ? agenda.opening : '').trim();
     const fallback = agenda.fallback || null;
+    // The main app's agenda currently carries no closing, so this is almost always empty
+    // and the per-mode fallback below is used. Read it anyway, so if a closing is ever
+    // added to bot_config the agent speaks it verbatim.
+    const providedClosing = String(agenda.closing || botConfig.closing || '').trim();
     const skills = Array.isArray(interview.skills) ? interview.skills.join(',') : (interview.skills || '');
 
     // Two call types: action='conduct' runs the interview questions in-call (fitment);
@@ -1376,7 +1380,7 @@ class InterviewBrainService {
       greeting = opening || fillTemplate(
         'Hi {candidate_name}, a quick reminder from {org_name} about your {jd_title}.',
         { candidate_name: candidateName, org_name: orgName, jd_title: jdTitle });
-      closing = `Thank you${candidateName ? `, ${candidateName}` : ''}. Have a great day!`;
+      closing = providedClosing || `Thank you${candidateName ? `, ${candidateName}` : ''}. Have a great day!`;
       return {
         prompt, greeting, closing, skills: '',
         durationMinutes: effectiveDurationMinutes || 2,
@@ -1407,7 +1411,7 @@ class InterviewBrainService {
         .replace(/\{org_name\}/g, orgName)
         .replace(/\{jd_title\}/g, jdTitle)
         .replace(/\{duration_minutes\}/g, String(effectiveDurationMinutes || 10));
-      closing = fitmentPromptConfig.closing || this.defaultClosing;
+      closing = providedClosing || fitmentPromptConfig.closing || this.defaultClosing;
     } else {
       // Invite topic (screening_topic > topic > jd_title) replaces the skill list
       const topic = String(botConfig.screening_topic || botConfig.topic || botConfig.jd_title || '').trim();
@@ -1423,7 +1427,7 @@ class InterviewBrainService {
         duration_minutes: String(effectiveDurationMinutes || Math.round(this.interviewDurationMs / 60000))
       };
       greeting = opening || fillTemplate(this.defaultGreeting, templateValues);
-      closing = fillTemplate(this.defaultClosing, templateValues);
+      closing = providedClosing || fillTemplate(this.defaultClosing, templateValues);
     }
 
     // A conversational opening (and/or a fallback link) → tell the LLM how to handle the
