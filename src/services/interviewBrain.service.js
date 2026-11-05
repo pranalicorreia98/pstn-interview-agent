@@ -368,6 +368,7 @@ class InterviewBrainService {
     let interviewEnded = false;     // Set after LLM acknowledges last fitment answer (or duration timer fires)
     let awaitingLastAnswer = false; // Set after last fitment question is asked — LLM still needed to acknowledge answer
     let pendingClose = false;    // Set when timer fires while bot is mid-speech
+    let pendingComplete = false; // llmDrivenClose: complete the call after the tailored closing plays
     let closingSent = false;     // Prevents closing from being sent more than once
     let completionScheduled = false; // Prevents onInterviewComplete from firing twice
     // Mutex: prevents concurrent processUserTurn executions.
@@ -595,6 +596,14 @@ class InterviewBrainService {
         pendingClose = false;
         logger.info('Sending deferred closing message (timer fired during bot speech)');
         sendClosingMessage();
+      }
+
+      // LLM-driven close: the tailored closing just finished playing — end the call.
+      if (pendingComplete && !completionScheduled) {
+        pendingComplete = false;
+        completionScheduled = true;
+        logger.info('LLM-driven closing finished playing — completing call');
+        if (config.onInterviewComplete) setTimeout(config.onInterviewComplete, 1500);
       }
     });
 
@@ -927,6 +936,7 @@ class InterviewBrainService {
       const APP_RETRY_DELAY_MS = 3000;
       const APP_MAX_RETRIES = 1;
       let fullResponse = null;
+      let endAfterThis = false; // llmDrivenClose: the LLM ended this response with <<END_CALL>>
       // Track whether we actually sent a flush to TTS.
       // When true, TTS Flushed is the ONLY correct place to reset isBotSpeaking —
       // resetting it here (before Flushed fires) allows bot's own TTS audio to leak
@@ -976,6 +986,14 @@ class InterviewBrainService {
             streamDurationMs: llmEndTime - llmFirstChunkTime,
             responseLength: response.length
           });
+
+          // LLM-driven tailored close (confirm_interest / cold call): the model ends its
+          // final message with <<END_CALL>>. Strip it before speaking/recording — the
+          // message itself IS the tailored closing.
+          if (config.llmDrivenClose && response && /<<\s*END[_ ]?CALL\s*>>/i.test(response)) {
+            endAfterThis = true;
+            response = response.replace(/<<\s*END[_ ]?CALL\s*>>/ig, '').trim();
+          }
 
           // Add assistant response to conversation history
           if (response) {
@@ -1069,6 +1087,16 @@ class InterviewBrainService {
           logger.info('Reminder acknowledged — closing after this message');
           interviewEnded = true;
           pendingClose = true;
+        }
+
+        // LLM-driven tailored close (confirm_interest / cold call): the LLM's final message
+        // IS the closing (marker stripped above). Complete after it plays — no fixed closing
+        // appended. Inert unless config.llmDrivenClose.
+        if (endAfterThis && !closingSent) {
+          closingSent = true;
+          interviewEnded = true;
+          pendingComplete = true;
+          logger.info('LLM-driven tailored closing delivered — completing after playback');
         }
       } else if (!interviewEnded) {
         // All retries failed — speak fallback so the user doesn't hear silence
@@ -1391,6 +1419,53 @@ class InterviewBrainService {
         awaitReplyAfterGreeting: true, // speak the reminder, then wait for their reply
         reminderMode: true,            // one ack then wrap up (see createSession)
         sttEndpointing: 700, sttUtteranceEndMs: 3000, answerGraceMs: 1800,
+        cameraLines: null,
+      };
+    }
+
+    // --- Cold outreach (confirm_interest): gauge interest first; if interested, take the
+    // quick details; if not, don't push. The LLM drives the flow and ends with its OWN
+    // closing tailored to how the call went, marked <<END_CALL>> (see createSession). ---
+    if (action === 'confirm_interest') {
+      candidateName = toDisplayName(candidate.first_name);
+      const link = fallback?.link;
+      const qList = questionItems.length > 0
+        ? questionItems.map((q, i) => `${i + 1}. ${q.question}`).join('\n')
+        : DEFAULT_FITMENT_QUESTIONS;
+      prompt =
+        `You are making a warm COLD outreach call on behalf of ${orgName} about the ${jdTitle} role, ` +
+        `to a candidate who did NOT apply — you found their profile. Be friendly and respectful, never pushy.\n\n` +
+        `You have ALREADY delivered the opening, which asked whether they'd be open to being considered. ` +
+        `The candidate is now replying. Follow this flow based on their response:\n\n` +
+        `1. Judge their interest from what they say.\n` +
+        `2. If they are INTERESTED and happy to share a few details now: ask the questions below ONE AT A ` +
+        `TIME, in order, with a brief natural acknowledgment after each. Ask nothing that isn't listed.\n` +
+        (link ? `3. If they are interested but busy, prefer to do it later, or prefer the link: let them know the ` +
+          `link is already in their WhatsApp and email, no rush.\n` : '') +
+        `4. If they are NOT interested: thank them warmly and do not push at all.\n\n` +
+        `QUESTIONS (only if they're interested and willing to share now):\n${qList}\n\n` +
+        `CLOSING — tailor it to how the call actually went, in one or two warm spoken sentences:\n` +
+        `- interested and shared the details -> thank them; say the team will review and be in touch about next steps.\n` +
+        (link ? `- interested but will use the link / do it later -> point them to the link in their WhatsApp and email.\n` : '') +
+        `- not interested -> thank them for their time and wish them well.\n\n` +
+        `When the conversation is complete, end your FINAL message (the tailored closing) with the exact ` +
+        `marker <<END_CALL>> on the same line. Output plain spoken sentences only (no formatting); the ` +
+        `marker is the one exception and is removed before anything is spoken.`;
+      greeting = opening || fillTemplate(
+        'Hi {candidate_name}, a quick call from {org_name} about a {jd_title} role.',
+        { candidate_name: candidateName, org_name: orgName, jd_title: jdTitle });
+      // Fallback only if the LLM never emits its tailored close (duration timer / hangup).
+      closing = providedClosing || `Thank you${candidateName ? `, ${candidateName}` : ''}. Have a great day!`;
+      return {
+        prompt, greeting, closing, skills: sessionSkills,
+        durationMinutes: effectiveDurationMinutes || 6,
+        questionCount: 0,            // LLM-driven; it decides when to close
+        candidateName, orgName, jdTitle,
+        language: configuredLanguage,
+        autoGreet: true,
+        awaitReplyAfterGreeting: true,
+        llmDrivenClose: true,        // LLM ends with a tailored closing + <<END_CALL>>
+        sttEndpointing: 800, sttUtteranceEndMs: 5000, answerGraceMs: 2500,
         cameraLines: null,
       };
     }
