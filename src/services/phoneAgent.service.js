@@ -36,9 +36,10 @@ const TRANSCRIPT_BACKUP_INTERVAL_MS = 60000;
 // their words become the next turn. Energy VAD runs on the candidate track, which here
 // contains no bot audio. Thresholds are env-tunable since they depend on the phone line.
 const BARGE_IN = String(process.env.BARGE_IN || '').toLowerCase() === 'on';
-const BARGE_VAD_RMS = parseInt(process.env.BARGE_VAD_RMS) || 1200;    // per-frame RMS above this = voiced
-const BARGE_MIN_FRAMES = parseInt(process.env.BARGE_MIN_FRAMES) || 6; // consecutive voiced frames (~120ms) to fire
+const BARGE_VAD_RMS = parseInt(process.env.BARGE_VAD_RMS) || 800;     // per-frame RMS above this = voiced
+const BARGE_MIN_FRAMES = parseInt(process.env.BARGE_MIN_FRAMES) || 4; // net voiced frames (leaky) to fire a barge-in
 const BARGE_RESUME_MS = parseInt(process.env.BARGE_RESUME_MS) || 600; // drop bot audio this long after a barge-in
+const BARGE_DEBUG = String(process.env.BARGE_DEBUG || 'on').toLowerCase() === 'on'; // log candidate RMS while bot speaks (tuning)
 
 class PhoneAgentService {
   constructor() {
@@ -151,16 +152,28 @@ class PhoneAgentService {
           const buf = Buffer.from(frame.data.buffer, frame.data.byteOffset, frame.data.byteLength);
           // Barge-in: candidate talking over the bot -> silence the bot + interrupt the brain.
           if (BARGE_IN && call.session.isBotSpeaking && call.session.isBotSpeaking()) {
-            if (this._frameRms(frame) >= BARGE_VAD_RMS) {
-              call.bargeVoiced = (call.bargeVoiced || 0) + 1;
-              if (call.bargeVoiced >= BARGE_MIN_FRAMES) {
-                call.bargeVoiced = 0;
-                logger.info('Barge-in detected — stopping bot', { roomName });
-                this._stopBotAudio(call);
-                if (call.session.interrupt) call.session.interrupt();
-              }
+            const rms = this._frameRms(frame);
+            // Leaky voiced counter — tolerant of brief dips between syllables (a strict
+            // consecutive count often never reaches the threshold on real speech).
+            if (rms >= BARGE_VAD_RMS) {
+              call.bargeVoiced = Math.min((call.bargeVoiced || 0) + 1, BARGE_MIN_FRAMES * 3);
             } else {
+              call.bargeVoiced = Math.max((call.bargeVoiced || 0) - 1, 0);
+            }
+            // Tuning: log candidate RMS while the bot speaks (throttled), so the threshold
+            // can be calibrated to this phone line. Turn off with BARGE_DEBUG=off.
+            if (BARGE_DEBUG && rms > 150) {
+              const now = Date.now();
+              if (!call.lastRmsLog || now - call.lastRmsLog > 400) {
+                call.lastRmsLog = now;
+                logger.info('barge VAD', { rms: Math.round(rms), thr: BARGE_VAD_RMS, voiced: call.bargeVoiced });
+              }
+            }
+            if (call.bargeVoiced >= BARGE_MIN_FRAMES) {
               call.bargeVoiced = 0;
+              logger.info('Barge-in detected — stopping bot', { roomName, rms: Math.round(rms) });
+              this._stopBotAudio(call);
+              if (call.session.interrupt) call.session.interrupt();
             }
           } else {
             call.bargeVoiced = 0;
@@ -286,7 +299,9 @@ class PhoneAgentService {
    *  is dropped in between. */
   _stopBotAudio(call) {
     call.bargeInStop = true;
-    try { if (call.audioSource && call.audioSource.clearQueue) call.audioSource.clearQueue(); } catch (e) { /* not all SDK versions */ }
+    let cleared = false;
+    try { if (call.audioSource && call.audioSource.clearQueue) { call.audioSource.clearQueue(); cleared = true; } } catch (e) { /* not all SDK versions */ }
+    logger.info('Barge-in: stopped bot audio', { clearQueue: cleared });
     if (call.bargeResetTimer) clearTimeout(call.bargeResetTimer);
     call.bargeResetTimer = setTimeout(() => { call.bargeInStop = false; }, BARGE_RESUME_MS);
   }
