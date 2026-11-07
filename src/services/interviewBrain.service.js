@@ -79,6 +79,23 @@ The goal is to assess their communication ability, personality, and cultural fit
 Ask open-ended questions and show genuine interest in their responses.
 `;
 
+// Flag-gated (PERSONA_WARM=on) delivery-style layer that makes the interviewer sound
+// less robotic WITHOUT changing what is assessed. Appended to the system prompt in
+// createSession only when the flag is on; default off = current behaviour unchanged.
+// Hard anti-leak + fairness limits are restated so warmth never becomes judgment.
+const WARM_PERSONA_PROMPT = `
+DELIVERY STYLE (this governs how you speak, not what you assess):
+- Vary your acknowledgments. Rotate naturally among short, neutral ones — "Got it.", "Okay.", "Right.", "Thanks.", "Makes sense.", "Noted." — instead of repeating the same phrase every turn.
+- Occasionally, and sparingly, use the candidate's first name — not every turn.
+- You may briefly reference what they just said to transition ("You mentioned microservices — let's stay there for a moment."), WITHOUT signalling whether it was right, wrong, good, or bad.
+- A short, natural connective at the start of a turn is fine ("Right, so…", "Okay, let's switch gears.").
+
+HARD LIMITS (unchanged, and they override the above):
+- Never praise, grade, confirm, correct, or hint at the correctness or quality of any answer. No "great", "exactly", "good point", "that's right", or similar. Warmth must never become judgment — it biases the candidate and leaks assessment.
+- Keep difficulty and behaviour comparable across candidates: vary phrasing, never substance.
+- Still exactly one question at a time, still brief.
+`;
+
 /**
  * Determine effective skills - use provided skills or fall back to communication assessment
  */
@@ -245,6 +262,11 @@ class InterviewBrainService {
     if (isDefaultCommunication) {
       logger.info('No technical skills provided, using communication skills assessment', { clientId: config.clientId });
       systemPrompt = `${systemPrompt}\n\n${DEFAULT_COMMUNICATION_SKILLS_PROMPT}`;
+    }
+    // Flag-gated warmer/varied persona (PERSONA_WARM=on). Default off = unchanged.
+    if (String(process.env.PERSONA_WARM || '').toLowerCase() === 'on') {
+      systemPrompt = `${systemPrompt}\n\n${WARM_PERSONA_PROMPT}`;
+      logger.info('PERSONA_WARM enabled — appended delivery-style layer');
     }
 
     const sessionConfig = {
