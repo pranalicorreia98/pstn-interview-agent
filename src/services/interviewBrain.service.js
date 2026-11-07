@@ -422,6 +422,7 @@ class InterviewBrainService {
     let backupCloseTimer = null; // Resetable timer for closing after last fitment question
     let sttReady = false;
     let sttPausedUntil = 0; // Timestamp: don't send audio to STT until this time (echo cooldown)
+    let bargeInActive = false; // true from a barge-in interrupt until the stale TTS flush is consumed
     // Audio that arrives before STT is open. The session is created by the first audio
     // chunk — usually the candidate saying hello — so dropping it loses their first words.
     let preSttBuffer = [];
@@ -640,6 +641,14 @@ class InterviewBrainService {
     });
 
     tts.on('flushed', () => {
+      if (bargeInActive) {
+        // This flush belongs to a turn the candidate barged in on. Don't re-gate STT or
+        // wipe their in-progress words — they're already talking. The next turn flushes
+        // normally. (One-shot: the chained engine emits a single flushed per batch.)
+        bargeInActive = false;
+        logger.info('TTS flushed after barge-in — skipping echo cooldown');
+        return;
+      }
       isBotSpeaking = false;
       // After bot finishes speaking, pause STT briefly to avoid echo feedback.
       // Screening mode needs a longer cooldown (2.5s) because the audio path is
@@ -1403,6 +1412,22 @@ class InterviewBrainService {
       },
       sttReady: () => sttReady,
       ttsReady: () => ttsReady,
+
+      /** Is the bot currently speaking? The transport uses this to know when a barge-in applies. */
+      isBotSpeaking: () => isBotSpeaking,
+
+      /** Barge-in: the candidate talked over the bot. Abort the in-flight LLM and open the STT
+       *  gate so their words become the next turn; the transport stops the queued audio.
+       *  Returns true only if a bot turn was actually interrupted. */
+      interrupt() {
+        if (!isBotSpeaking) return false;
+        logger.info('Barge-in: candidate interrupted — aborting bot turn');
+        bargeInActive = true;                 // suppress the stale TTS flushed echo-cooldown
+        if (pendingLLMAbort) { try { pendingLLMAbort.abort(); } catch (e) { /* ignore */ } }
+        isBotSpeaking = false;                // open the gate so sendAudio() forwards their words
+        sttPausedUntil = 0;                   // lift any echo cooldown immediately
+        return true;
+      },
 
       /** Send audio from meeting to STT (gated: skip while bot is speaking or in echo cooldown) */
       sendAudio(audioBuffer) {

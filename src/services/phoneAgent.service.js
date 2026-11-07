@@ -31,6 +31,15 @@ const OUTPUT_RATE = 48000;  // LiveKit's native rate — publishing at this and 
 const OUT_FRAME_SAMPLES = OUTPUT_RATE / 50; // 20 ms frames at 48 kHz
 const TRANSCRIPT_BACKUP_INTERVAL_MS = 60000;
 
+// Barge-in (flag BARGE_IN=on, PSTN only — separate tracks make it feasible). When the
+// candidate speaks over the bot, stop the bot's queued audio and interrupt the brain so
+// their words become the next turn. Energy VAD runs on the candidate track, which here
+// contains no bot audio. Thresholds are env-tunable since they depend on the phone line.
+const BARGE_IN = String(process.env.BARGE_IN || '').toLowerCase() === 'on';
+const BARGE_VAD_RMS = parseInt(process.env.BARGE_VAD_RMS) || 1200;    // per-frame RMS above this = voiced
+const BARGE_MIN_FRAMES = parseInt(process.env.BARGE_MIN_FRAMES) || 6; // consecutive voiced frames (~120ms) to fire
+const BARGE_RESUME_MS = parseInt(process.env.BARGE_RESUME_MS) || 600; // drop bot audio this long after a barge-in
+
 class PhoneAgentService {
   constructor() {
     // Active calls: roomName -> { room, session, audioSource, ... }
@@ -139,7 +148,24 @@ class PhoneAgentService {
         for await (const frame of call.audioStream) {
           if (!call.session) break;
           resetInactivityTimer();
-          call.session.sendAudio(Buffer.from(frame.data.buffer, frame.data.byteOffset, frame.data.byteLength));
+          const buf = Buffer.from(frame.data.buffer, frame.data.byteOffset, frame.data.byteLength);
+          // Barge-in: candidate talking over the bot -> silence the bot + interrupt the brain.
+          if (BARGE_IN && call.session.isBotSpeaking && call.session.isBotSpeaking()) {
+            if (this._frameRms(frame) >= BARGE_VAD_RMS) {
+              call.bargeVoiced = (call.bargeVoiced || 0) + 1;
+              if (call.bargeVoiced >= BARGE_MIN_FRAMES) {
+                call.bargeVoiced = 0;
+                logger.info('Barge-in detected — stopping bot', { roomName });
+                this._stopBotAudio(call);
+                if (call.session.interrupt) call.session.interrupt();
+              }
+            } else {
+              call.bargeVoiced = 0;
+            }
+          } else {
+            call.bargeVoiced = 0;
+          }
+          call.session.sendAudio(buf);
         }
       })().catch(err => logger.error('Error reading candidate audio', { roomName, error: err.message }));
       resetInactivityTimer();
@@ -226,6 +252,7 @@ class PhoneAgentService {
    */
   publishAudio(call, audioBuffer) {
     if (!call.audioSource || !call.resampler) return;
+    if (call.bargeInStop) return; // barge-in: don't queue new bot audio while stopped
     // Drop a trailing odd byte rather than misalign 16-bit samples
     const usable = audioBuffer.length - (audioBuffer.length % 2);
     if (usable <= 0) return;
@@ -238,10 +265,30 @@ class PhoneAgentService {
       for (let offset = 0; offset < s.length; offset += OUT_FRAME_SAMPLES) {
         const chunk = s.slice(offset, Math.min(offset + OUT_FRAME_SAMPLES, s.length));
         call.playout = call.playout
-          .then(() => call.audioSource && call.audioSource.captureFrame(new AudioFrame(chunk, OUTPUT_RATE, 1, chunk.length)))
+          .then(() => call.audioSource && !call.bargeInStop && call.audioSource.captureFrame(new AudioFrame(chunk, OUTPUT_RATE, 1, chunk.length)))
           .catch(err => logger.error('Error publishing audio', { error: err.message }));
       }
     }
+  }
+
+  /** RMS energy of a candidate audio frame (Int16) — the VAD signal for barge-in. */
+  _frameRms(frame) {
+    const d = frame.data;
+    if (!d || !d.length) return 0;
+    let sum = 0;
+    for (let i = 0; i < d.length; i++) sum += d[i] * d[i];
+    return Math.sqrt(sum / d.length);
+  }
+
+  /** Barge-in: immediately silence the bot. Stops new frames and skips the frames already
+   *  queued in the real-time playout chain (so playback halts within ~one frame); re-enables
+   *  output after BARGE_RESUME_MS so the next turn plays — the aborted turn's trailing synth
+   *  is dropped in between. */
+  _stopBotAudio(call) {
+    call.bargeInStop = true;
+    try { if (call.audioSource && call.audioSource.clearQueue) call.audioSource.clearQueue(); } catch (e) { /* not all SDK versions */ }
+    if (call.bargeResetTimer) clearTimeout(call.bargeResetTimer);
+    call.bargeResetTimer = setTimeout(() => { call.bargeInStop = false; }, BARGE_RESUME_MS);
   }
 
   /**
@@ -258,6 +305,7 @@ class PhoneAgentService {
 
     // Clear timers
     if (call.inactivityTimer) clearTimeout(call.inactivityTimer);
+    if (call.bargeResetTimer) clearTimeout(call.bargeResetTimer);
     call.timers.forEach(t => { clearTimeout(t); clearInterval(t); });
 
     // Get final data before the session is closed
