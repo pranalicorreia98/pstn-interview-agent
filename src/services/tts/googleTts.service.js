@@ -81,6 +81,52 @@ const LANGUAGE_VOICE_MAP = {
   },
 };
 
+// ---------------------------------------------------------------------------
+// HD voice tiers (feature-flagged — default OFF = current Wavenet behaviour).
+//
+// Verified against the live Google TTS voices API (2026-11):
+//   - Chirp3-HD: available for ALL 9 Indian languages here; most natural tier;
+//     does NOT support SSML (plain text only).
+//   - Neural2:   en-IN and hi-IN only; supports SSML.
+// Select with env TTS_VOICE_TIER = wavenet (default) | chirp3hd | neural2.
+// Any tier that isn't available for a given language falls back to Wavenet,
+// and a runtime synth failure on an HD voice also falls back to Wavenet, so
+// turning the flag on can never break a call.
+// ---------------------------------------------------------------------------
+const HD_VOICE_TIERS = {
+  chirp3hd: { male: 'Chirp3-HD-Charon', female: 'Chirp3-HD-Aoede', ssml: false, langs: 'all' },
+  neural2:  { male: 'Neural2-C',        female: 'Neural2-A',        ssml: true,  langs: ['en-IN', 'hi-IN'] },
+};
+
+function voiceTier() {
+  return String(process.env.TTS_VOICE_TIER || 'wavenet').toLowerCase();
+}
+
+/** Resolve the voice name for a language/gender honouring the TTS_VOICE_TIER flag. */
+function resolveVoiceName(languageCode, gender = 'male') {
+  const base = LANGUAGE_VOICE_MAP[languageCode] || LANGUAGE_VOICE_MAP['en-IN'];
+  const wavenet = gender === 'female' ? base.voiceFemale : base.voice;
+  const tier = HD_VOICE_TIERS[voiceTier()];
+  if (!tier) return wavenet; // 'wavenet' or unknown value -> unchanged behaviour
+  const langOk = tier.langs === 'all' || tier.langs.includes(base.languageCode);
+  if (!langOk) return wavenet; // tier not offered for this language -> safe fallback
+  return `${base.languageCode}-${gender === 'female' ? tier.female : tier.male}`;
+}
+
+/** Chirp3-HD voices are text-only; everything else accepts SSML. */
+function voiceSupportsSsml(voiceName) {
+  return !/Chirp3-HD/i.test(String(voiceName || ''));
+}
+
+/** Strip SSML tags to plain text (used when the selected voice can't take SSML). */
+function stripSsml(text) {
+  return String(text)
+    .replace(/<break[^>]*>/gi, ' ')
+    .replace(/<[^>]+>/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
 /**
  * GoogleTTSStream - Mimics Deepgram's LiveTTS interface
  *
@@ -99,7 +145,7 @@ class GoogleTTSStream extends EventEmitter {
     const langConfig = LANGUAGE_VOICE_MAP[languageCode] || LANGUAGE_VOICE_MAP['en-IN'];
 
     this.languageCode = langConfig.languageCode;
-    this.voiceName = voiceName || langConfig.voice;
+    this.voiceName = voiceName || resolveVoiceName(langConfig.languageCode, 'male');
     this.sampleRate = sampleRate;
 
     this.client = null;
@@ -211,13 +257,22 @@ class GoogleTTSStream extends EventEmitter {
       });
 
       let audioBuffer;
-
-      if (this.useRestApi) {
-        // Use REST API with API key
-        audioBuffer = await this._synthesizeWithRestApi(textToSynthesize);
-      } else {
-        // Use SDK with service account
-        audioBuffer = await this._synthesizeWithSdk(textToSynthesize);
+      try {
+        audioBuffer = await this._synthesize(textToSynthesize);
+      } catch (synthErr) {
+        // Safety net: if an HD voice fails (bad name / unavailable / quota),
+        // fall back to the language's Wavenet voice so the call never breaks.
+        const base = LANGUAGE_VOICE_MAP[this.languageCode] || LANGUAGE_VOICE_MAP['en-IN'];
+        const isWavenet = this.voiceName === base.voice || this.voiceName === base.voiceFemale;
+        if (!isWavenet) {
+          logger.warn('HD voice synth failed — falling back to Wavenet', {
+            failedVoice: this.voiceName, fallback: base.voice, error: synthErr.message,
+          });
+          this.voiceName = base.voice; // sticky for the rest of this stream
+          audioBuffer = await this._synthesize(textToSynthesize);
+        } else {
+          throw synthErr;
+        }
       }
 
       const ttsEndTime = Date.now();
@@ -279,6 +334,25 @@ class GoogleTTSStream extends EventEmitter {
     }
   }
 
+  /** Dispatch to REST or SDK synth. @private */
+  async _synthesize(text) {
+    return this.useRestApi
+      ? this._synthesizeWithRestApi(text)
+      : this._synthesizeWithSdk(text);
+  }
+
+  /**
+   * Build the Google TTS `input` object. If the text is SSML (`<speak>…`) and the
+   * current voice supports SSML, send it as SSML; if the voice is text-only
+   * (Chirp3-HD), strip the tags; otherwise send plain text. @private
+   */
+  _buildInput(text) {
+    if (/^\s*<speak[\s>]/i.test(text)) {
+      return voiceSupportsSsml(this.voiceName) ? { ssml: text } : { text: stripSsml(text) };
+    }
+    return { text };
+  }
+
   /**
    * Synthesize speech using Google Cloud TTS REST API with API key
    * @private
@@ -287,7 +361,7 @@ class GoogleTTSStream extends EventEmitter {
     const url = `https://texttospeech.googleapis.com/v1/text:synthesize?key=${this.apiKey}`;
 
     const requestBody = {
-      input: { text },
+      input: this._buildInput(text),
       voice: {
         languageCode: this.languageCode,
         name: this.voiceName,
@@ -329,7 +403,7 @@ class GoogleTTSStream extends EventEmitter {
    */
   async _synthesizeWithSdk(text) {
     const request = {
-      input: { text },
+      input: this._buildInput(text),
       voice: {
         languageCode: this.languageCode,
         name: this.voiceName,
@@ -438,7 +512,7 @@ function createGoogleTTSStream(options = {}) {
   } = options;
 
   const langConfig = LANGUAGE_VOICE_MAP[language] || LANGUAGE_VOICE_MAP['en-IN'];
-  const voiceName = voice || (gender === 'female' ? langConfig.voiceFemale : langConfig.voice);
+  const voiceName = voice || resolveVoiceName(langConfig.languageCode, gender);
 
   const stream = new GoogleTTSStream(language, voiceName, sampleRate);
 
@@ -454,4 +528,7 @@ module.exports = {
   GoogleTTSStream,
   createGoogleTTSStream,
   LANGUAGE_VOICE_MAP,
+  resolveVoiceName,
+  voiceSupportsSsml,
+  voiceTier,
 };
