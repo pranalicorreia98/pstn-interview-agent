@@ -113,6 +113,29 @@ function resolveVoiceName(languageCode, gender = 'male') {
   return `${base.languageCode}-${gender === 'female' ? tier.female : tier.male}`;
 }
 
+/**
+ * Upgrade an already-chosen voice (e.g. an explicit 'en-IN-Wavenet-A' that a caller
+ * passes in) to the active HD tier, preserving language + gender. This is what makes
+ * TTS_VOICE_TIER actually take effect, because callers pass an explicit voice name
+ * which otherwise bypasses resolveVoiceName(). No-op when the tier is 'wavenet', the
+ * voice is already HD, or the tier isn't offered for that language.
+ */
+function upgradeVoiceToTier(voiceName) {
+  const tier = HD_VOICE_TIERS[voiceTier()];
+  if (!tier || !voiceName) return voiceName;
+  if (/Chirp3-HD|Neural2/i.test(voiceName)) return voiceName; // already an HD voice
+  const m = String(voiceName).match(/^([a-z]{2}-[A-Z]{2})-/);
+  if (!m) return voiceName;
+  const lang = m[1];
+  if (!(tier.langs === 'all' || tier.langs.includes(lang))) return voiceName;
+  const base = LANGUAGE_VOICE_MAP[lang];
+  let gender = 'male';
+  if (base && voiceName === base.voiceFemale) gender = 'female';
+  else if (base && voiceName === base.voice) gender = 'male';
+  else gender = /-(A|C|E)$/.test(voiceName) ? 'female' : 'male'; // heuristic fallback
+  return `${lang}-${gender === 'female' ? tier.female : tier.male}`;
+}
+
 /** Chirp3-HD voices are text-only; everything else accepts SSML. */
 function voiceSupportsSsml(voiceName) {
   return !/Chirp3-HD/i.test(String(voiceName || ''));
@@ -145,7 +168,9 @@ class GoogleTTSStream extends EventEmitter {
     const langConfig = LANGUAGE_VOICE_MAP[languageCode] || LANGUAGE_VOICE_MAP['en-IN'];
 
     this.languageCode = langConfig.languageCode;
-    this.voiceName = voiceName || resolveVoiceName(langConfig.languageCode, 'male');
+    // Upgrade whatever voice we land on (explicit arg or resolved default) to the
+    // active HD tier — callers pass an explicit voice, so this is where the flag bites.
+    this.voiceName = upgradeVoiceToTier(voiceName || resolveVoiceName(langConfig.languageCode, 'male'));
     this.sampleRate = sampleRate;
 
     this.client = null;
