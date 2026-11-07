@@ -140,6 +140,45 @@ function sanitizeForTTS(text) {
     .trim();
 }
 
+// Split a growing text buffer into COMPLETE sentences (ending in . ! ? followed by
+// whitespace) and the trailing incomplete fragment. Used by streaming TTS so each
+// finished sentence can be synthesized/played while the LLM is still generating the
+// rest — far lower first-audio latency than buffering the whole reply. Decimals like
+// "15.5" are not split because the '.' isn't followed by whitespace.
+function extractSentences(buffer) {
+  const sentences = [];
+  let start = 0;
+  const re = /[.!?]["')\]]*\s/g; // sentence-ending punctuation (+ closing quote/paren) + whitespace
+  let m;
+  while ((m = re.exec(buffer)) !== null) {
+    const endIdx = m.index + m[0].length;
+    const sentence = buffer.slice(start, endIdx).trim();
+    if (sentence) sentences.push(sentence);
+    start = endIdx;
+  }
+  return { sentences, rest: buffer.slice(start) };
+}
+
+// Adaptive end-of-turn grace (flag TURN_ADAPTIVE=on). Instead of a flat grace after the
+// candidate pauses, wait LONGER when their last words look mid-thought (a trailing
+// conjunction/filler or a comma) so we don't cut them off, and respond a little SOONER
+// when they clearly finished a sentence. Conservative shortening (we have no barge-in
+// yet, so over-cutting is unrecoverable). Returns the base value unchanged when neither
+// signal is present.
+const TURN_CONTINUERS = new Set(['and', 'but', 'so', 'because', 'or', 'that', 'which', 'to', 'the', 'a', 'an', 'of', 'with', 'for', 'my', 'is', 'was', 'i', 'we', 'they', 'like', 'um', 'uh', 'er', 'basically', 'actually', 'mean', 'just', 'also', 'then', 'if', 'when']);
+function adaptiveGraceMs(text, baseMs) {
+  const t = String(text || '').trim();
+  if (!t) return baseMs;
+  const lastWord = (t.toLowerCase().match(/[a-z']+$/) || [''])[0];
+  if (TURN_CONTINUERS.has(lastWord) || /,$/.test(t)) {
+    return Math.round(baseMs * 1.6);                   // mid-thought — give more time
+  }
+  if (/[.!?]["')\]]*$/.test(t)) {
+    return Math.max(1300, Math.round(baseMs * 0.75));  // clear sentence end — respond sooner
+  }
+  return baseMs;
+}
+
 // Hard limit on simultaneous voice sessions to prevent cost overrun
 const MAX_CONCURRENT_SESSIONS = 3;
 
@@ -988,10 +1027,36 @@ class InterviewBrainService {
           logger.info('LLM stream started', { latencyMs: llmFirstChunkTime - llmStartTime });
 
           let response = '';
+          const streamTts = String(process.env.TTS_STREAMING || '').toLowerCase() === 'on';
+          let ttsBuffer = '';            // streaming mode: text not yet sent to TTS
+          let firstFlushThisTurn = true;
 
-          // Buffer the full LLM response before sending to TTS.
-          // Streaming chunk-by-chunk causes uneven audio (fast/slow, dropped words)
-          // because TTS has to synthesize tiny fragments with network latency gaps.
+          // Streaming mode: synthesize + play one finished piece now. Applies the
+          // one-time camera reminder to the first flush. The <<END_CALL>> marker has no
+          // sentence terminator, so it never reaches here mid-stream (it stays in the
+          // tail and is stripped before the tail is spoken).
+          const flushPieceNow = async (raw) => {
+            let clean = sanitizeForTTS(raw);
+            if (!clean) return;
+            if (firstFlushThisTurn && cameraBackOnPending && config.cameraLines?.backOn && cameraOn === false) {
+              cameraBackOnPending = false;
+              logger.info('Camera off mid-interview — reminding before next question');
+              interviewTranscript.push({
+                speaker: 'Interviewer',
+                text: config.cameraLines.backOn,
+                timestamp_ms: Date.now() - sessionStartTime,
+                duration_ms: 0
+              });
+              clean = `${sanitizeForTTS(config.cameraLines.backOn)} ${clean}`;
+            }
+            firstFlushThisTurn = false;
+            tts.sendText(clean);
+            await tts.flush();
+            ttsFlushSent = true;
+          };
+
+          // Default: buffer the whole reply (smoothest audio). TTS_STREAMING=on: speak
+          // sentence-by-sentence as the LLM generates, for much lower first-audio latency.
           for await (const chunk of stream) {
             if (abortController.signal.aborted) {
               logger.info('LLM stream aborted');
@@ -999,14 +1064,22 @@ class InterviewBrainService {
             }
 
             const delta = chunk.choices[0]?.delta?.content;
-            if (delta) response += delta;
+            if (!delta) continue;
+            response += delta;
+            if (streamTts && ttsReady) {
+              ttsBuffer += delta;
+              const { sentences, rest } = extractSentences(ttsBuffer);
+              ttsBuffer = rest;
+              for (const s of sentences) await flushPieceNow(s);
+            }
           }
 
           const llmEndTime = Date.now();
           logger.info('LLM response complete', {
             totalLatencyMs: llmEndTime - llmStartTime,
             streamDurationMs: llmEndTime - llmFirstChunkTime,
-            responseLength: response.length
+            responseLength: response.length,
+            streaming: streamTts
           });
 
           // LLM-driven tailored close (confirm_interest / cold call): the model ends its
@@ -1017,13 +1090,20 @@ class InterviewBrainService {
             response = response.replace(/<<\s*END[_ ]?CALL\s*>>/ig, '').trim();
           }
 
+          // Streaming mode: speak the leftover tail (last, unterminated sentence),
+          // with the END_CALL marker stripped.
+          if (streamTts && ttsReady && !abortController.signal.aborted) {
+            const tail = ttsBuffer.replace(/<<\s*END[_ ]?CALL\s*>>/ig, '').trim();
+            if (tail) await flushPieceNow(tail);
+          }
+
           // Add assistant response to conversation history
           if (response) {
             recordBotTurn(response);
           }
 
-          // Send the complete response to TTS in one go for smooth audio
-          if (ttsReady && !abortController.signal.aborted && response) {
+          // Non-streaming (default): send the complete response to TTS in one go.
+          if (!streamTts && ttsReady && !abortController.signal.aborted && response) {
             let clean = sanitizeForTTS(response);
             if (clean && cameraBackOnPending && config.cameraLines?.backOn && cameraOn === false) {
               cameraBackOnPending = false;
@@ -1214,9 +1294,13 @@ class InterviewBrainService {
           scheduleBackupClose();
         }
 
-        // speech_final means the user paused — give them answerGraceMs to continue
+        // speech_final means the user paused — give them grace to continue. With
+        // TURN_ADAPTIVE=on the grace flexes with how "finished" their words sound.
         if (data.speech_final && currentTranscript.trim()) {
-          answerGraceTimer = setTimeout(() => commitAnswer('speech_final + grace'), answerGraceMs);
+          const graceMs = String(process.env.TURN_ADAPTIVE || '').toLowerCase() === 'on'
+            ? adaptiveGraceMs(currentTranscript, answerGraceMs)
+            : answerGraceMs;
+          answerGraceTimer = setTimeout(() => commitAnswer('speech_final + grace'), graceMs);
         }
       }
     });
